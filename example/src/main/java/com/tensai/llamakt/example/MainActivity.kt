@@ -49,8 +49,9 @@ class MainActivity : ComponentActivity() {
         var copying by remember { mutableStateOf(false) }
         var generationJob by remember { mutableStateOf<Job?>(null) }
 
-        // GPU layers — hardcoded to 99 (offload all). Tweak here if needed.
-        val nGpuLayers = 99
+        // GPU layers — 0 = CPU-only (Mali-G68 has no usable OpenCL backend; avoids pointless offload attempt)
+        // Set to 99 to re-enable full GPU offload on devices with a working OpenCL backend (Adreno etc.)
+        val nGpuLayers = 0
         val nCtx = 4096
 
         val scrollState = rememberScrollState()

@@ -298,8 +298,10 @@ target_compile_options(llamakt PRIVATE
     # General
     -D_GNU_SOURCE
     -pthread
-    # ARM64 target
-    -march=armv8.2-a+dotprod+i8mm
+    # ARM64 target — armv8.2-a+dotprod only (no i8mm / no smmla)
+    # i8mm (ARMv8.6) is NOT present on e.g. MediaTek Dimensity 900 (Cortex-A78, ARMv8.2)
+    # → keeping +i8mm here causes SIGILL on those CPUs via lm_ggml_gemm_q8_0_4x8_q8_0
+    -march=armv8.2-a+dotprod
     # Optimisation
     -O3 -DNDEBUG
     -ffunction-sections -fdata-sections
