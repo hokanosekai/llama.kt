@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+**/build/
+!src/**/build/
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# NDK / CMake
+.cxx/
+*.so
+*.o
+*.a
+
+# Android Studio captures
+captures/
+
+# Keystore
+*.jks
+*.keystore
+
+# Generated
+generated/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# third_party/ — NOT ignored (will be git submodules)
