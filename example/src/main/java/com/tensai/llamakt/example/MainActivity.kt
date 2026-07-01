@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.tensai.llamakt.BackendInfo
 import com.tensai.llamakt.ChatMessage
 import com.tensai.llamakt.LlamaEngine
 import com.tensai.llamakt.chat
@@ -36,6 +37,7 @@ class MainActivity : ComponentActivity() {
         engine.free()
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun BenchScreen() {
         // State
@@ -50,12 +52,24 @@ class MainActivity : ComponentActivity() {
         var copying by remember { mutableStateOf(false) }
         var generationJob by remember { mutableStateOf<Job?>(null) }
 
-        // GPU layers — 99 = full offload on Vulkan backend (Mali-G68, Adreno, etc.)
-        // Vulkan backend is now compiled in; OpenCL won't init on Mali so Vulkan is picked automatically
-        val nGpuLayers = 99
+        // Backend state
+        var availableBackends by remember { mutableStateOf<List<BackendInfo>>(emptyList()) }
+        var activeBackendStr by remember { mutableStateOf("") }
+        // Backend selector: true = GPU offload (nGpuLayers=99), false = CPU (nGpuLayers=0)
+        var useGpu by remember { mutableStateOf(true) }
+        val nGpuLayers by derivedStateOf { if (useGpu) 99 else 0 }
         val nCtx = 4096
 
         val scrollState = rememberScrollState()
+
+        // List backends at startup
+        LaunchedEffect(Unit) {
+            val backends = withContext(Dispatchers.IO) {
+                try { engine.availableBackends() } catch (e: Exception) { emptyList() }
+            }
+            availableBackends = backends
+            android.util.Log.i("MainActivity", "Available backends: $backends")
+        }
 
         // SAF picker: OpenDocument for any binary/mime
         val picker = rememberLauncherForActivityResult(
@@ -66,6 +80,7 @@ class MainActivity : ComponentActivity() {
             copying = true
             status = "Copying GGUF to cache… (may take a while for large files)"
             modelLoaded = false
+            activeBackendStr = ""
 
             lifecycleScope.launch(Dispatchers.IO) {
                 try {
@@ -97,6 +112,67 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text("LlamaKt Bench", fontSize = 20.sp, style = MaterialTheme.typography.titleLarge)
+
+                    // Available backends list
+                    if (availableBackends.isNotEmpty()) {
+                        Text("Backends:", style = MaterialTheme.typography.labelSmall)
+                        availableBackends.forEach { b ->
+                            val icon = when (b.type) {
+                                "gpu", "igpu" -> "GPU"
+                                "cpu" -> "CPU"
+                                else -> b.type.uppercase()
+                            }
+                            Text(
+                                "  [$icon] ${b.description}: ${b.name}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+
+                    // Backend selector: CPU vs GPU
+                    val hasGpuBackend = availableBackends.any { it.type == "gpu" || it.type == "igpu" }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("Backend:", style = MaterialTheme.typography.bodyMedium)
+                        FilterChip(
+                            selected = !useGpu,
+                            onClick = {
+                                if (!generating) {
+                                    useGpu = false
+                                    modelLoaded = false
+                                    activeBackendStr = ""
+                                }
+                            },
+                            label = { Text("CPU") },
+                            enabled = !generating && !copying,
+                        )
+                        FilterChip(
+                            selected = useGpu,
+                            onClick = {
+                                if (!generating && hasGpuBackend) {
+                                    useGpu = true
+                                    modelLoaded = false
+                                    activeBackendStr = ""
+                                }
+                            },
+                            label = { Text("GPU") },
+                            enabled = !generating && !copying && hasGpuBackend,
+                        )
+                        if (!hasGpuBackend) {
+                            Text("(no GPU device)", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+
+                    // Active backend badge — shown after model load
+                    if (activeBackendStr.isNotEmpty()) {
+                        Text(
+                            "Backend: $activeBackendStr",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
 
                     // Model picker
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -139,14 +215,18 @@ class MainActivity : ComponentActivity() {
 
                                 generationJob = lifecycleScope.launch {
                                     try {
-                                        // Load model if not already loaded
+                                        // Load model if not already loaded (or backend changed)
                                         if (!modelLoaded) {
                                             status = "Loading model (nGpuLayers=$nGpuLayers)…"
                                             withContext(Dispatchers.IO) {
                                                 engine.load(path, nGpuLayers, nCtx)
                                             }
                                             modelLoaded = true
-                                            status = "Model loaded. Generating…"
+                                            // Query active backend right after load
+                                            activeBackendStr = withContext(Dispatchers.IO) {
+                                                engine.activeBackend()
+                                            }
+                                            status = "Model loaded [$activeBackendStr]. Generating…"
                                         }
 
                                         var tokenCount = 0
@@ -169,7 +249,8 @@ class MainActivity : ComponentActivity() {
                                         val elapsedSec = (System.currentTimeMillis() - startMs) / 1000f
                                         if (elapsedSec > 0f) tokPerSec = tokenCount / elapsedSec
                                         kvUsed = engine.kvUsed()
-                                        status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s)".format(elapsedSec, tokPerSec)
+                                        status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s) [$activeBackendStr]"
+                                            .format(elapsedSec, tokPerSec)
 
                                     } catch (e: CancellationException) {
                                         status = "Interrupted."
@@ -201,6 +282,9 @@ class MainActivity : ComponentActivity() {
                         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                             Text("%.1f tok/s".format(tokPerSec), style = MaterialTheme.typography.labelMedium)
                             Text("KV used: $kvUsed tokens", style = MaterialTheme.typography.labelMedium)
+                            if (activeBackendStr.isNotEmpty()) {
+                                Text(activeBackendStr, style = MaterialTheme.typography.labelMedium)
+                            }
                         }
                     }
 
@@ -208,7 +292,7 @@ class MainActivity : ComponentActivity() {
                     Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
 
                     // Output
-                    Divider()
+                    HorizontalDivider()
                     Text(
                         text = output.ifEmpty { "(output will appear here)" },
                         modifier = Modifier

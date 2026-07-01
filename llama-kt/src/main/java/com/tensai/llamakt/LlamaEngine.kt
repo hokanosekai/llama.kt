@@ -6,6 +6,18 @@ import org.json.JSONObject
 /** A single message in a chat conversation. */
 data class ChatMessage(val role: String, val content: String)
 
+/**
+ * Information about a single ggml backend device.
+ * [name] — device name as reported by ggml (e.g. "Mali-G68 MC4")
+ * [description] — backend registry name (e.g. "Vulkan", "CPU")
+ * [type] — "cpu", "gpu", "igpu", or "accel"
+ */
+data class BackendInfo(
+    val name: String,
+    val description: String,
+    val type: String,
+)
+
 class LlamaEngine {
 
     private var handle: Long = 0L
@@ -15,8 +27,33 @@ class LlamaEngine {
     // ------------------------------------------------------------------
 
     /**
+     * List all available ggml backend devices (CPU, Vulkan, OpenCL, …).
+     * Static — does not require a model to be loaded.
+     * Parses the JSON returned by nativeListBackends().
+     */
+    fun availableBackends(): List<BackendInfo> {
+        val raw = nativeListBackends()
+        val arr = JSONArray(raw)
+        return (0 until arr.length()).map { i ->
+            val obj = arr.getJSONObject(i)
+            BackendInfo(
+                name        = obj.optString("deviceName", "Unknown"),
+                description = obj.optString("backend", "unknown"),
+                type        = obj.optString("type", "unknown"),
+            )
+        }
+    }
+
+    /**
+     * Return the backend actually used for inference on the loaded model.
+     * Deduced from n_gpu_layers and the first GPU device in the ggml registry.
+     * Requires a model to be loaded.
+     */
+    fun activeBackend(): String = nativeActiveBackend(handle)
+
+    /**
      * Load a GGUF model from [path].
-     * [nGpuLayers] = 0 → CPU only; > 0 → offload to GPU via OpenCL.
+     * [nGpuLayers] = 0 → CPU only; > 0 → offload layers to GPU (Vulkan on Mali).
      * [nCtx] = context window size (tokens). Defaults to 4096.
      * Throws [IllegalStateException] if the native load fails.
      */
@@ -86,6 +123,8 @@ class LlamaEngine {
     // JNI declarations — names and types must match tensai_jni.cpp exactly
     // ------------------------------------------------------------------
 
+    private external fun nativeListBackends(): String
+    private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(h: Long, prompt: String, nPredict: Int, cb: TokenCallback)

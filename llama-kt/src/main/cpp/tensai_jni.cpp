@@ -4,7 +4,8 @@
  * Entry points:
  *   nativeLoadModel, nativeFree, nativeCompletion,
  *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
- *   nativeInterrupt, nativeSaveSession, nativeLoadSession
+ *   nativeInterrupt, nativeSaveSession, nativeLoadSession,
+ *   nativeListBackends, nativeActiveBackend
  *
  * KV used-cells strategy: this version of llama.cpp (b9769) exposes no
  * public llama_kv_self_used_cells() or llama_kv_self_n_tokens(). The
@@ -20,8 +21,10 @@
 
 #include "rn-llama.h"
 #include "rn-completion.h"
+#include "rn-common.hpp"
 #include "common/common.h"
 #include "llama.h"
+#include "ggml-backend.h"
 
 #define LOG_TAG "TensaiJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -41,6 +44,89 @@ static std::string jstring_to_std(JNIEnv* env, jstring js) {
     std::string result(chars);
     env->ReleaseStringUTFChars(js, chars);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// nativeListBackends  (static — no model required)
+// ---------------------------------------------------------------------------
+// Returns a JSON array describing all available ggml backend devices.
+// Uses the existing backend_devices_info() from rn-common.hpp which
+// enumerates lm_ggml_backend_dev_count() devices and collects:
+//   backend  — backend registry name (e.g. "Vulkan", "CPU", "OpenCL")
+//   type     — "cpu" | "gpu" | "igpu" | "accel"
+//   deviceName — human-readable device name (e.g. "Mali-G68 MC4")
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeListBackends(
+        JNIEnv* env,
+        jobject /* thiz */)
+{
+    std::string info = rnllama::backend_devices_info();
+    LOGI("nativeListBackends: %s", info.c_str());
+    return env->NewStringUTF(info.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// nativeActiveBackend  (requires loaded model handle)
+// ---------------------------------------------------------------------------
+// Determines which backend is actually being used for inference.
+// Approach: if n_gpu_layers > 0, find the first GPU/iGPU device in the
+// ggml device registry — that device is what llama.cpp selected for
+// offloading. If n_gpu_layers == 0, it's CPU.
+// This is a deduction rather than a direct query because llama.cpp does
+// not expose a "which backend is my context using" API at the public level.
+// Returns a string like "Vulkan: Mali-G68 MC4" or "CPU: ARM CPU".
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong h)
+{
+    if (h == 0L) {
+        return env->NewStringUTF("CPU (no model loaded)");
+    }
+    auto* rnctx = to_ctx(h);
+
+    const bool gpu_offload = (rnctx->params.n_gpu_layers != 0);
+
+    if (!gpu_offload) {
+        // Find CPU device name
+        const size_t dev_count = lm_ggml_backend_dev_count();
+        for (size_t i = 0; i < dev_count; i++) {
+            lm_ggml_backend_dev_t dev = lm_ggml_backend_dev_get(i);
+            if (dev == nullptr) continue;
+            if (lm_ggml_backend_dev_type(dev) == LM_GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const char* name = lm_ggml_backend_dev_name(dev);
+                std::string result = std::string("CPU: ") + (name ? name : "ARM CPU");
+                LOGI("nativeActiveBackend: %s", result.c_str());
+                return env->NewStringUTF(result.c_str());
+            }
+        }
+        return env->NewStringUTF("CPU");
+    }
+
+    // GPU offload — find first GPU or iGPU device
+    const size_t dev_count = lm_ggml_backend_dev_count();
+    for (size_t i = 0; i < dev_count; i++) {
+        lm_ggml_backend_dev_t dev = lm_ggml_backend_dev_get(i);
+        if (dev == nullptr) continue;
+        enum lm_ggml_backend_dev_type dtype = lm_ggml_backend_dev_type(dev);
+        if (dtype == LM_GGML_BACKEND_DEVICE_TYPE_GPU ||
+            dtype == LM_GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            lm_ggml_backend_reg_t reg = lm_ggml_backend_dev_backend_reg(dev);
+            const char* backend_name = reg ? lm_ggml_backend_reg_name(reg) : "GPU";
+            const char* dev_name = lm_ggml_backend_dev_name(dev);
+            std::string result = std::string(backend_name ? backend_name : "GPU")
+                               + ": " + (dev_name ? dev_name : "unknown");
+            LOGI("nativeActiveBackend: %s", result.c_str());
+            return env->NewStringUTF(result.c_str());
+        }
+    }
+
+    // GPU requested but no GPU device found — fell back to CPU
+    LOGI("nativeActiveBackend: GPU requested but no GPU device in registry, likely CPU fallback");
+    return env->NewStringUTF("CPU (GPU requested but unavailable)");
 }
 
 // ---------------------------------------------------------------------------
