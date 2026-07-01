@@ -11,6 +11,11 @@
             android:name="libOpenCL.so"
             android:required="false" />
 
+        <!-- Required for Vulkan GPU backend (Mali, Adreno, etc.) -->
+        <uses-native-library
+            android:name="libvulkan.so"
+            android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

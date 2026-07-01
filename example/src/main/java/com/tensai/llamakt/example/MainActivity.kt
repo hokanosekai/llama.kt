@@ -50,9 +50,9 @@ class MainActivity : ComponentActivity() {
         var copying by remember { mutableStateOf(false) }
         var generationJob by remember { mutableStateOf<Job?>(null) }
 
-        // GPU layers — 0 = CPU-only (Mali-G68 has no usable OpenCL backend; avoids pointless offload attempt)
-        // Set to 99 to re-enable full GPU offload on devices with a working OpenCL backend (Adreno etc.)
-        val nGpuLayers = 0
+        // GPU layers — 99 = full offload on Vulkan backend (Mali-G68, Adreno, etc.)
+        // Vulkan backend is now compiled in; OpenCL won't init on Mali so Vulkan is picked automatically
+        val nGpuLayers = 99
         val nCtx = 4096
 
         val scrollState = rememberScrollState()

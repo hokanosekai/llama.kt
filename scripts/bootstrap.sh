@@ -39,6 +39,9 @@ mkdir -p "$CPP_DIR/models"
 mkdir -p "$CPP_DIR/ggml-opencl"
 mkdir -p "$CPP_DIR/nlohmann"
 mkdir -p "$CPP_DIR/jsi"
+mkdir -p "$CPP_DIR/ggml-vulkan/shaders"
+mkdir -p "$CPP_DIR/vulkan-hpp/vulkan"
+mkdir -p "$CPP_DIR/spirv-headers/spirv/unified1"
 
 # ---------------------------------------------------------------------------
 # ggml public headers
@@ -61,6 +64,76 @@ echo "==> Copying ggml-opencl..."
 rm -rf "$CPP_DIR/ggml-opencl"
 cp -r "$LLAMA_DIR/ggml/src/ggml-opencl" "$CPP_DIR/"
 rm -f "$CPP_DIR/ggml-opencl/CMakeLists.txt"
+
+# ---------------------------------------------------------------------------
+# ggml-vulkan (Android Vulkan GPU backend — Mali, Adreno, etc.)
+# ---------------------------------------------------------------------------
+echo "==> Setting up ggml-vulkan..."
+
+# 1. Copy ggml-vulkan.cpp and ggml-vulkan.h from submodule
+cp "$LLAMA_DIR/ggml/src/ggml-vulkan/ggml-vulkan.cpp" "$CPP_DIR/ggml-vulkan/"
+cp "$LLAMA_DIR/ggml/include/ggml-vulkan.h"            "$CPP_DIR/ggml-vulkan/"
+
+# 2. Build vulkan-shaders-gen for host and generate SPIR-V shaders
+#    Prerequisites: cmake, glslc (from shaderc/glslang), g++
+VK_SHADERS_SRC="$LLAMA_DIR/ggml/src/ggml-vulkan/vulkan-shaders"
+VK_BUILD_DIR="/tmp/llama-kt-vk-shaders-build"
+VK_SPV_DIR="/tmp/llama-kt-vk-shaders-spv"
+VK_OUT_DIR="/tmp/llama-kt-vk-shaders-out"
+
+mkdir -p "$VK_BUILD_DIR" "$VK_SPV_DIR" "$VK_OUT_DIR"
+
+echo "  Building vulkan-shaders-gen for host..."
+cmake -S "$VK_SHADERS_SRC" -B "$VK_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -Wno-dev > /dev/null 2>&1
+cmake --build "$VK_BUILD_DIR" --config Release -j$(nproc) > /dev/null 2>&1
+VK_GEN="$VK_BUILD_DIR/vulkan-shaders-gen"
+
+if [ ! -x "$VK_GEN" ]; then
+  echo "ERROR: vulkan-shaders-gen build failed — cannot generate Vulkan shaders"
+  exit 1
+fi
+
+echo "  Generating ggml-vulkan-shaders.hpp header..."
+"$VK_GEN" \
+  --output-dir "$VK_SPV_DIR" \
+  --target-hpp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp"
+
+echo "  Compiling GLSL shaders to SPIR-V and generating per-shader .cpp files..."
+for comp in "$VK_SHADERS_SRC"/*.comp; do
+  base=$(basename "$comp")
+  "$VK_GEN" \
+    --glslc "$(which glslc)" \
+    --source "$comp" \
+    --output-dir "$VK_SPV_DIR" \
+    --target-hpp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp" \
+    --target-cpp "$VK_OUT_DIR/${base}.cpp"
+done
+
+cp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp" "$CPP_DIR/ggml-vulkan/"
+
+# Fix relative include in shader cpp files (they're compiled from shaders/ subdir)
+for f in "$VK_OUT_DIR"/*.cpp; do
+  sed 's|#include "ggml-vulkan-shaders.hpp"|#include "../ggml-vulkan-shaders.hpp"|g' "$f" \
+    > "$CPP_DIR/ggml-vulkan/shaders/$(basename "$f")"
+done
+
+# 3. Bundle Vulkan C++ binding headers (vulkan.hpp — not in NDK sysroot)
+VULKAN_HEADERS_DIR="/tmp/Vulkan-Headers"
+if [ ! -d "$VULKAN_HEADERS_DIR" ]; then
+  echo "  Cloning Vulkan-Headers for vulkan.hpp..."
+  git clone --depth=1 --branch v1.4.350 https://github.com/KhronosGroup/Vulkan-Headers "$VULKAN_HEADERS_DIR"
+fi
+cp "$VULKAN_HEADERS_DIR/include/vulkan/"*.hpp "$CPP_DIR/vulkan-hpp/vulkan/" 2>/dev/null || true
+
+# 4. Bundle SPIR-V headers (spirv/unified1/spirv.hpp)
+SPIRV_HEADERS_DIR="/tmp/SPIRV-Headers"
+if [ ! -d "$SPIRV_HEADERS_DIR" ]; then
+  echo "  Cloning SPIRV-Headers..."
+  git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_DIR"
+fi
+cp "$SPIRV_HEADERS_DIR/include/spirv/unified1/spirv.hpp" "$CPP_DIR/spirv-headers/spirv/unified1/"
+
+echo "  Vulkan setup complete ($(ls "$CPP_DIR/ggml-vulkan/shaders/" | wc -l) shaders)"
 
 # ---------------------------------------------------------------------------
 # ggml-cpu
@@ -316,6 +389,10 @@ echo "==> Applying LM_ prefix rewrites..."
 
 files_add_lm_prefix=(
   "$CPP_DIR/ggml-opencl/"*.cpp
+
+  # Vulkan backend (ggml-vulkan.cpp and its header)
+  "$CPP_DIR/ggml-vulkan/ggml-vulkan.cpp"
+  "$CPP_DIR/ggml-vulkan/ggml-vulkan.h"
 
   "$CPP_DIR/ggml-cpu/"*.h
   "$CPP_DIR/ggml-cpu/"*.c

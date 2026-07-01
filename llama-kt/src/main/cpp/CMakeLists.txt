@@ -9,6 +9,9 @@ set(CMAKE_C_STANDARD 11)
 
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ── Vulkan (Android system library) ──────────────────────────────────────────
+find_library(VULKAN_LIB vulkan)
+
 # ── Include directories ─────────────────────────────────────────────────────
 include_directories(
     ${SRC_DIR}
@@ -18,6 +21,10 @@ include_directories(
     ${SRC_DIR}/tools/mtmd
     ${SRC_DIR}/nlohmann
     ${SRC_DIR}/jsi
+    # Vulkan backend sources + generated shader header
+    ${SRC_DIR}/ggml-vulkan
+    # SPIR-V headers (for spirv/unified1/spirv.hpp)
+    ${SRC_DIR}/spirv-headers
 )
 
 # ── Source lists ─────────────────────────────────────────────────────────────
@@ -83,6 +90,14 @@ set(JSI_SOURCES
 
 # JNI stub
 set(JNI_STUB ${SRC_DIR}/tensai_jni.cpp)
+
+# ── Vulkan backend + generated SPIR-V shaders ────────────────────────────────
+set(GGML_VULKAN_SOURCES
+    ${SRC_DIR}/ggml-vulkan/ggml-vulkan.cpp
+)
+file(GLOB GGML_VULKAN_SHADER_SOURCES CONFIGURE_DEPENDS
+    ${SRC_DIR}/ggml-vulkan/shaders/*.cpp
+)
 
 # ── OpenCL kernel embedding ──────────────────────────────────────────────────
 set(GGML_OPENCL_KERNELS
@@ -266,6 +281,9 @@ add_library(llamakt SHARED
     # OpenCL backend
     ${SRC_DIR}/ggml-opencl/ggml-opencl.cpp
     ${GGML_OPENCL_KERNEL_HEADERS}
+    # Vulkan backend + SPIR-V shaders
+    ${GGML_VULKAN_SOURCES}
+    ${GGML_VULKAN_SHADER_SOURCES}
     # JNI stub
     ${JNI_STUB}
 )
@@ -283,10 +301,18 @@ target_include_directories(llamakt PRIVATE
     ${SRC_DIR}/../../../../third_party/OpenCL-Headers
     # Generated kernel headers
     ${CMAKE_CURRENT_BINARY_DIR}
+    # Vulkan backend sources + generated shader header
+    ${SRC_DIR}/ggml-vulkan
+    # SPIR-V headers
+    ${SRC_DIR}/spirv-headers
 )
+
 
 # ── Compile definitions ───────────────────────────────────────────────────────
 target_compile_options(llamakt PRIVATE
+    # Vulkan C++ headers must be found before NDK sysroot's older Vulkan headers
+    # (NDK 27.2 ships VK_HEADER_VERSION 275; vulkan.hpp v1.4.350 requires 350)
+    -I${SRC_DIR}/vulkan-hpp
     # CPU backend
     -DLM_GGML_USE_CPU
     -DLM_GGML_USE_CPU_REPACK
@@ -295,6 +321,8 @@ target_compile_options(llamakt PRIVATE
     -DLM_GGML_OPENCL_USE_ADRENO_KERNELS
     -DLM_GGML_OPENCL_EMBED_KERNELS
     -DLM_GGML_OPENCL_SOA_Q
+    # Vulkan backend (Mali-G68 + any Vulkan 1.1+ GPU)
+    -DLM_GGML_USE_VULKAN
     # General
     -D_GNU_SOURCE
     -pthread
@@ -324,6 +352,8 @@ target_link_libraries(llamakt PRIVATE
     ${LOG_LIB}
     android
     OpenCL
+    # Vulkan — Android system library (present on API 24+, always available on Mali devices)
+    ${VULKAN_LIB}
 )
 
 target_link_options(llamakt PRIVATE
