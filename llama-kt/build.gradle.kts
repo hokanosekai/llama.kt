@@ -10,5 +10,5 @@ android {
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
     ndkVersion = "27.2.12479018"
 }
-kotlin { jvmToolchain(17) }
+kotlin { jvmToolchain(21) }
 dependencies { implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0") }
