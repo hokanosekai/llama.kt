@@ -12,7 +12,7 @@ Working. Validated on-device (OPPO / MediaTek Dimensity 900, arm64): loads a GGU
 |---|---|
 | CPU (arm64, `armv8.2-a+dotprod`) | ✅ works everywhere |
 | OpenCL (Adreno 700+, Snapdragon) | ✅ compiled in — untested on Adreno hardware yet |
-| Vulkan (Mali, Xclipse, …) | ⏳ planned — needed for non-Adreno GPUs |
+| Vulkan (Mali, Xclipse, any Vulkan 1.2+ GPU) | ✅ works — validated on Mali-G68 (Dimensity 900) |
 | CPU per-feature dispatch (i8mm/SVE on capable cores) | ⏳ planned — currently a single conservative variant |
 
 Multimodal (vision via `mtmd`) is vendored but not yet wired through the Kotlin API.
@@ -104,6 +104,13 @@ bash scripts/build-opencl.sh
 ## Upstream tracking
 
 The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mtmd.hpp` + the `ggml-opencl/` backend. We extract files, not fork the repo (avoids merge conflicts from the JS side). To pull upstream changes: bump the `third_party/llama.cpp` submodule deliberately (breaking API changes are frequent), re-run `bootstrap.sh`, port relevant `rn-*` changes from a fresh llama.rn checkout, rebuild. The `cpp/jsi/` React Native adapter is intentionally dropped.
+
+## Roadmap
+
+- **Published AAR** (Maven Central) — install with `implementation("io.github.hokanosekai:llama-kt:…")` instead of a git submodule. The submodule path stays supported; this is about lowering the barrier to consume the lib.
+- **Runtime backend auto-selection** — pick Vulkan / OpenCL / CPU per device automatically, with a manual override.
+- **CPU per-feature dispatch** — ship multiple CPU variants (baseline / dotprod / i8mm / SVE) and select at runtime, to keep i8mm speed on capable cores without crashing older ones.
+- **Multimodal** — wire the vendored `mtmd` (vision) through the Kotlin API.
 
 ## License
 
