@@ -7,7 +7,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -30,6 +33,15 @@ import com.tensai.llamakt.LlamaEngine
 import com.tensai.llamakt.chat
 import kotlinx.coroutines.*
 import java.io.File
+
+private val PRESET_PROMPTS = listOf(
+    "Hello, who are you?",
+    "Explain the HyperLogLog algorithm in detail.",
+    "Write a Python script to compute the Fibonacci sequence, with an explanation.",
+    "Summarize the theory of general relativity for a beginner.",
+    "Write a detailed essay about the history of computing.",
+    "List 20 creative startup ideas, each with a one-line description.",
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -291,6 +303,27 @@ class MainActivity : ComponentActivity() {
 
                     localPath?.let {
                         Text("Model: ${File(it).name}", style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    // Preset prompt chips
+                    Text("Presets:", style = MaterialTheme.typography.labelSmall)
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                    ) {
+                        items(PRESET_PROMPTS) { preset ->
+                            SuggestionChip(
+                                onClick = { prompt = preset },
+                                label = {
+                                    Text(
+                                        text = preset.take(32) + if (preset.length > 32) "…" else "",
+                                        maxLines = 1,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                },
+                                enabled = !generating,
+                            )
+                        }
                     }
 
                     // Prompt input
