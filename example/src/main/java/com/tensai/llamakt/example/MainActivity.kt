@@ -7,7 +7,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -354,7 +353,14 @@ class MainActivity : ComponentActivity() {
         val nGpuLayers by derivedStateOf { if (useGpu) 99 else 0 }
         val nCtx = 4096
 
-        val scrollState = rememberScrollState()
+        // Live metric snapshots for stats strip
+        var currentRamMb by remember { mutableStateOf<Float?>(null) }
+        var currentCpuPct by remember { mutableStateOf<Float?>(null) }
+
+        // Graphs collapsed by default
+        var showGraphs by remember { mutableStateOf(false) }
+
+        val outputScrollState = rememberScrollState()
 
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
@@ -394,37 +400,71 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val hasGpuBackend = availableBackends.any { it.type == "gpu" || it.type == "igpu" }
+
+        // Build stats strip text
+        val statsText = buildString {
+            if (tokPerSec > 0f) append("%.1f tok/s".format(tokPerSec))
+            currentRamMb?.let { ram ->
+                if (isNotEmpty()) append(" · ")
+                append("%.0f MB".format(ram))
+            }
+            currentCpuPct?.let { cpu ->
+                if (isNotEmpty()) append(" · ")
+                append("%.0f%% CPU".format(cpu))
+            }
+            if (activeBackendStr.isNotEmpty()) {
+                if (isNotEmpty()) append(" · ")
+                append("⚡ $activeBackendStr")
+            }
+        }
+
         MaterialTheme {
             Surface(modifier = Modifier.fillMaxSize()) {
+                // Root column: NO verticalScroll — output takes weight(1f) + own scroll
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text("LlamaKt Bench", fontSize = 20.sp, style = MaterialTheme.typography.titleLarge)
+                    // ── Title ────────────────────────────────────────────────
+                    Text(
+                        "LlamaKt Bench",
+                        fontSize = 20.sp,
+                        style = MaterialTheme.typography.titleLarge,
+                    )
 
-                    if (availableBackends.isNotEmpty()) {
-                        Text("Backends:", style = MaterialTheme.typography.labelSmall)
-                        availableBackends.forEach { b ->
-                            val icon = when (b.type) {
-                                "gpu", "igpu" -> "GPU"
-                                "cpu" -> "CPU"
-                                else -> b.type.uppercase()
-                            }
-                            Text(
-                                "  [$icon] ${b.description}: ${b.name}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                    }
-
-                    val hasGpuBackend = availableBackends.any { it.type == "gpu" || it.type == "igpu" }
+                    // ── Pick GGUF + model name ────────────────────────────────
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text("Backend:", style = MaterialTheme.typography.bodyMedium)
+                        Button(
+                            onClick = { picker.launch(arrayOf("*/*")) },
+                            enabled = !copying && !generating,
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        ) { Text("Pick GGUF") }
+
+                        if (copying) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                        }
+
+                        localPath?.let { path ->
+                            Text(
+                                File(path).name,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+
+                    // ── Segmented backend selector (ONLY backend control) ──────
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         FilterChip(
                             selected = !useGpu,
                             onClick = {
@@ -449,35 +489,16 @@ class MainActivity : ComponentActivity() {
                             label = { Text("GPU") },
                             enabled = !generating && !copying && hasGpuBackend,
                         )
-                        if (!hasGpuBackend) {
-                            Text("(no GPU device)", style = MaterialTheme.typography.labelSmall)
+                        if (!hasGpuBackend && availableBackends.isNotEmpty()) {
+                            Text(
+                                "(no GPU device)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outlineVariant,
+                            )
                         }
                     }
 
-                    if (activeBackendStr.isNotEmpty()) {
-                        Text(
-                            "Backend: $activeBackendStr",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = { picker.launch(arrayOf("*/*")) },
-                            enabled = !copying && !generating
-                        ) { Text("Pick GGUF") }
-
-                        if (copying) {
-                            CircularProgressIndicator(modifier = Modifier.size(24.dp).align(Alignment.CenterVertically))
-                        }
-                    }
-
-                    localPath?.let {
-                        Text("Model: ${File(it).name}", style = MaterialTheme.typography.bodySmall)
-                    }
-
-                    Text("Presets:", style = MaterialTheme.typography.labelSmall)
+                    // ── Preset chips ──────────────────────────────────────────
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         contentPadding = PaddingValues(horizontal = 2.dp),
@@ -497,14 +518,16 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // ── Prompt field ──────────────────────────────────────────
                     OutlinedTextField(
                         value = prompt,
                         onValueChange = { prompt = it },
                         label = { Text("Prompt") },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !generating
+                        enabled = !generating,
                     )
 
+                    // ── Generate / Stop ───────────────────────────────────────
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
@@ -515,6 +538,8 @@ class MainActivity : ComponentActivity() {
                                 output = ""
                                 tokPerSec = 0f
                                 kvUsed = 0
+                                currentRamMb = null
+                                currentCpuPct = null
                                 tokSamples.clear()
                                 ramSamples.clear()
                                 cpuSamples.clear()
@@ -569,10 +594,16 @@ class MainActivity : ComponentActivity() {
                                                         // Sample RAM + CPU + GPU on IO dispatcher
                                                         withContext(Dispatchers.IO) {
                                                             readRamMb()?.let { ramMb ->
-                                                                withContext(Dispatchers.Main) { ramSamples.add(ramMb) }
+                                                                withContext(Dispatchers.Main) {
+                                                                    ramSamples.add(ramMb)
+                                                                    currentRamMb = ramMb
+                                                                }
                                                             }
                                                             CpuSampler.sample()?.let { cpu ->
-                                                                withContext(Dispatchers.Main) { cpuSamples.add(cpu) }
+                                                                withContext(Dispatchers.Main) {
+                                                                    cpuSamples.add(cpu)
+                                                                    currentCpuPct = cpu
+                                                                }
                                                             }
                                                             val gpu = GpuSampler.sample()
                                                             withContext(Dispatchers.Main) {
@@ -611,7 +642,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             },
-                            enabled = !generating && !copying && localPath != null
+                            enabled = !generating && !copying && localPath != null,
                         ) { Text("Generate") }
 
                         Button(
@@ -621,73 +652,89 @@ class MainActivity : ComponentActivity() {
                                 status = "Interrupted."
                                 generating = false
                             },
-                            enabled = generating
+                            enabled = generating,
                         ) { Text("Stop") }
                     }
 
-                    // Stats bar
-                    if (tokPerSec > 0f || kvUsed > 0) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                            Text("%.1f tok/s".format(tokPerSec), style = MaterialTheme.typography.labelMedium)
-                            Text("KV used: $kvUsed tokens", style = MaterialTheme.typography.labelMedium)
-                            if (activeBackendStr.isNotEmpty()) {
-                                Text(activeBackendStr, style = MaterialTheme.typography.labelMedium)
-                            }
+                    // ── Stats strip ───────────────────────────────────────────
+                    // Single compact line: tok/s · RAM MB · CPU% · ⚡ device
+                    if (statsText.isNotEmpty()) {
+                        Text(
+                            statsText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+
+                    // Status line
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+
+                    // ── Graphs toggle ─────────────────────────────────────────
+                    TextButton(
+                        onClick = { showGraphs = !showGraphs },
+                        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            if (showGraphs) "▾ Graphs" else "▸ Graphs",
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+
+                    // ── Live graphs (collapsible) ─────────────────────────────
+                    if (showGraphs) {
+                        val graphHeight = 80.dp
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            LiveGraph(
+                                samples = tokSamples,
+                                label = "Tok/s",
+                                unit = "tok/s",
+                                primaryColor = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.fillMaxWidth().height(graphHeight),
+                            )
+                            LiveGraph(
+                                samples = ramSamples,
+                                label = "RAM (MB)",
+                                unit = "MB",
+                                primaryColor = Color(0xFF43A047),
+                                modifier = Modifier.fillMaxWidth().height(graphHeight),
+                            )
+                            LiveGraph(
+                                samples = cpuSamples,
+                                label = "CPU (%)",
+                                unit = "%",
+                                primaryColor = Color(0xFFFF8F00),
+                                modifier = Modifier.fillMaxWidth().height(graphHeight),
+                            )
+                            LiveGraph(
+                                samples = gpuSamples,
+                                label = "GPU (%)",
+                                unit = "%",
+                                primaryColor = Color(0xFFAB47BC),
+                                modifier = Modifier.fillMaxWidth().height(graphHeight),
+                                unavailable = gpuUnavailable,
+                            )
                         }
                     }
 
-                    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
-
-                    // ── Live graphs ────────────────────────────────────────────
-                    val graphHeight = 100.dp
-
-                    // tok/s
-                    LiveGraph(
-                        samples = tokSamples,
-                        label = "Tok/s",
-                        unit = "tok/s",
-                        primaryColor = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.fillMaxWidth().height(graphHeight),
-                    )
-
-                    // RAM
-                    LiveGraph(
-                        samples = ramSamples,
-                        label = "RAM (MB)",
-                        unit = "MB",
-                        primaryColor = Color(0xFF43A047), // green
-                        modifier = Modifier.fillMaxWidth().height(graphHeight),
-                    )
-
-                    // CPU
-                    LiveGraph(
-                        samples = cpuSamples,
-                        label = "CPU (%)",
-                        unit = "%",
-                        primaryColor = Color(0xFFFF8F00), // amber
-                        modifier = Modifier.fillMaxWidth().height(graphHeight),
-                    )
-
-                    // GPU
-                    LiveGraph(
-                        samples = gpuSamples,
-                        label = "GPU (%)",
-                        unit = "%",
-                        primaryColor = Color(0xFFAB47BC), // purple
-                        modifier = Modifier.fillMaxWidth().height(graphHeight),
-                        unavailable = gpuUnavailable,
-                    )
-                    // ──────────────────────────────────────────────────────────
-
                     HorizontalDivider()
-                    Text(
-                        text = output.ifEmpty { "(output will appear here)" },
+
+                    // ── Output — weight(1f) + own verticalScroll ──────────────
+                    // Always visible, never cropped, scrollable independently.
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
-                            .verticalScroll(scrollState),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+                            .verticalScroll(outputScrollState),
+                    ) {
+                        Text(
+                            text = output.ifEmpty { "(output will appear here)" },
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
                 }
             }
         }
