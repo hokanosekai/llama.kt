@@ -52,15 +52,19 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         JNIEnv* env,
         jobject /* thiz */,
         jstring path,
-        jint nGpuLayers)
+        jint nGpuLayers,
+        jint nCtx)
 {
     auto* rnctx = new rnllama::llama_rn_context();
 
     common_params p;
     p.model.path   = jstring_to_std(env, path);
     p.n_gpu_layers = static_cast<int32_t>(nGpuLayers);
+    p.n_ctx        = static_cast<int32_t>(nCtx > 0 ? nCtx : 4096);
+    if (p.n_batch <= 0) p.n_batch = 512;
 
-    LOGI("loadModel: path=%s n_gpu_layers=%d", p.model.path.c_str(), p.n_gpu_layers);
+    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d",
+         p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch);
 
     if (!rnctx->loadModel(p)) {
         LOGE("loadModel failed");

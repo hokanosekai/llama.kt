@@ -11,10 +11,11 @@ class LlamaEngine {
     /**
      * Load a GGUF model from [path].
      * [nGpuLayers] = 0 → CPU only; > 0 → offload to GPU via OpenCL.
+     * [nCtx] = context window size (tokens). Defaults to 4096.
      * Throws [IllegalStateException] if the native load fails.
      */
-    fun load(path: String, nGpuLayers: Int = 0) {
-        handle = nativeLoadModel(path, nGpuLayers)
+    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096) {
+        handle = nativeLoadModel(path, nGpuLayers, nCtx)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -62,7 +63,7 @@ class LlamaEngine {
     // JNI declarations — names and types must match tensai_jni.cpp exactly
     // ------------------------------------------------------------------
 
-    private external fun nativeLoadModel(path: String, nGpuLayers: Int): Long
+    private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(h: Long, prompt: String, cb: TokenCallback)
     private external fun nativeTokenize(h: Long, text: String): IntArray

@@ -51,6 +51,7 @@ class MainActivity : ComponentActivity() {
 
         // GPU layers — hardcoded to 99 (offload all). Tweak here if needed.
         val nGpuLayers = 99
+        val nCtx = 4096
 
         val scrollState = rememberScrollState()
 
@@ -140,7 +141,7 @@ class MainActivity : ComponentActivity() {
                                         if (!modelLoaded) {
                                             status = "Loading model (nGpuLayers=$nGpuLayers)…"
                                             withContext(Dispatchers.IO) {
-                                                engine.load(path, nGpuLayers)
+                                                engine.load(path, nGpuLayers, nCtx)
                                             }
                                             modelLoaded = true
                                             status = "Model loaded. Generating…"
