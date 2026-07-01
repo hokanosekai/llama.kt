@@ -6,6 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -13,6 +14,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
@@ -37,6 +45,98 @@ class MainActivity : ComponentActivity() {
         engine.free()
     }
 
+    @Composable
+    fun LiveTokGraph(
+        samples: List<Float>,
+        primaryColor: Color,
+        modifier: Modifier = Modifier,
+    ) {
+        val textMeasurer = rememberTextMeasurer()
+
+        if (samples.isEmpty()) {
+            Box(modifier = modifier, contentAlignment = Alignment.Center) {
+                Text(
+                    "(graph will appear during generation)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                )
+            }
+            return
+        }
+
+        Canvas(modifier = modifier) {
+            val w = size.width
+            val h = size.height
+            val padLeft = 48f   // room for Y labels
+            val padRight = 8f
+            val padTop = 8f
+            val padBottom = 24f // room for X hint
+
+            val graphW = w - padLeft - padRight
+            val graphH = h - padTop - padBottom
+
+            val maxVal = (samples.max() * 1.15f).coerceAtLeast(1f)
+
+            // Background grid — 3 horizontal lines
+            val gridColor = primaryColor.copy(alpha = 0.12f)
+            val labelColor = primaryColor.copy(alpha = 0.55f)
+            val gridSteps = 3
+            for (i in 0..gridSteps) {
+                val fy = padTop + graphH * (1f - i.toFloat() / gridSteps)
+                drawLine(gridColor, Offset(padLeft, fy), Offset(padLeft + graphW, fy), strokeWidth = 1f)
+
+                // Y label
+                val labelVal = maxVal * i / gridSteps
+                val labelText = if (labelVal >= 10f) "%.0f".format(labelVal) else "%.1f".format(labelVal)
+                val measured = textMeasurer.measure(
+                    labelText,
+                    style = TextStyle(fontSize = 9.sp, color = labelColor)
+                )
+                drawText(measured, topLeft = Offset(padLeft - measured.size.width - 4f, fy - measured.size.height / 2f))
+            }
+
+            // Polyline
+            if (samples.size >= 2) {
+                val path = Path()
+                samples.forEachIndexed { idx, v ->
+                    val x = padLeft + graphW * idx / (samples.size - 1).toFloat()
+                    val y = padTop + graphH * (1f - (v / maxVal).coerceIn(0f, 1f))
+                    if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                drawPath(path, color = primaryColor, style = Stroke(width = 2.5f))
+
+                // Last-point dot
+                val lastX = padLeft + graphW
+                val lastY = padTop + graphH * (1f - (samples.last() / maxVal).coerceIn(0f, 1f))
+                drawCircle(primaryColor, radius = 4f, center = Offset(lastX, lastY))
+            } else {
+                // Single point — just a dot
+                val x = padLeft + graphW / 2f
+                val y = padTop + graphH * (1f - (samples.first() / maxVal).coerceIn(0f, 1f))
+                drawCircle(primaryColor, radius = 4f, center = Offset(x, y))
+            }
+
+            // Average line (dashed-ish via short segments)
+            val avg = samples.average().toFloat()
+            val avgY = padTop + graphH * (1f - (avg / maxVal).coerceIn(0f, 1f))
+            val dashLen = 6f
+            val gapLen = 4f
+            var x = padLeft
+            while (x < padLeft + graphW) {
+                val x2 = (x + dashLen).coerceAtMost(padLeft + graphW)
+                drawLine(primaryColor.copy(alpha = 0.35f), Offset(x, avgY), Offset(x2, avgY), strokeWidth = 1f)
+                x += dashLen + gapLen
+            }
+            // Avg label on the right
+            val avgText = "avg %.1f".format(avg)
+            val avgMeasured = textMeasurer.measure(
+                avgText,
+                style = TextStyle(fontSize = 9.sp, color = primaryColor.copy(alpha = 0.55f))
+            )
+            drawText(avgMeasured, topLeft = Offset(padLeft + graphW - avgMeasured.size.width - 2f, avgY - avgMeasured.size.height - 2f))
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun BenchScreen() {
@@ -51,6 +151,9 @@ class MainActivity : ComponentActivity() {
         var generating by remember { mutableStateOf(false) }
         var copying by remember { mutableStateOf(false) }
         var generationJob by remember { mutableStateOf<Job?>(null) }
+
+        // Live tok/s graph samples — instantaneous throughput via sliding window
+        val tokSamples = remember { mutableStateListOf<Float>() }
 
         // Backend state
         var availableBackends by remember { mutableStateOf<List<BackendInfo>>(emptyList()) }
@@ -210,6 +313,7 @@ class MainActivity : ComponentActivity() {
                                 output = ""
                                 tokPerSec = 0f
                                 kvUsed = 0
+                                tokSamples.clear()
                                 generating = true
                                 status = "Generating…"
 
@@ -232,13 +336,39 @@ class MainActivity : ComponentActivity() {
                                         var tokenCount = 0
                                         val startMs = System.currentTimeMillis()
 
+                                        // Sliding window: keep timestamps of last N tokens for instantaneous tok/s
+                                        val windowSize = 16
+                                        val tokenTimestamps = ArrayDeque<Long>(windowSize + 1)
+
+                                        // Sampling: emit a graph point every ~400ms
+                                        var lastSampleMs = 0L
+
                                         val messages = listOf(ChatMessage("user", prompt))
                                         engine.chat(messages).collect { token ->
                                             output += token
                                             tokenCount++
 
-                                            val elapsedSec = (System.currentTimeMillis() - startMs) / 1000f
+                                            val nowMs = System.currentTimeMillis()
+
+                                            // Maintain sliding window of timestamps
+                                            tokenTimestamps.addLast(nowMs)
+                                            if (tokenTimestamps.size > windowSize) tokenTimestamps.removeFirst()
+
+                                            val elapsedSec = (nowMs - startMs) / 1000f
                                             if (elapsedSec > 0f) tokPerSec = tokenCount / elapsedSec
+
+                                            // Compute instantaneous tok/s over the sliding window
+                                            if (tokenTimestamps.size >= 2) {
+                                                val windowSec = (tokenTimestamps.last() - tokenTimestamps.first()) / 1000f
+                                                if (windowSec > 0f) {
+                                                    val instantTokPerSec = (tokenTimestamps.size - 1) / windowSec
+                                                    // Emit a sample every ~400ms
+                                                    if (nowMs - lastSampleMs >= 400L) {
+                                                        tokSamples.add(instantTokPerSec)
+                                                        lastSampleMs = nowMs
+                                                    }
+                                                }
+                                            }
 
                                             // Sample KV usage every 10 tokens (avoid JNI spam)
                                             if (tokenCount % 10 == 0) {
@@ -290,6 +420,15 @@ class MainActivity : ComponentActivity() {
 
                     // Status line
                     Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+
+                    // Live tok/s graph
+                    LiveTokGraph(
+                        samples = tokSamples,
+                        primaryColor = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp)
+                    )
 
                     // Output
                     HorizontalDivider()
