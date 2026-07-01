@@ -111,63 +111,6 @@ private object CpuSampler {
     }
 }
 
-/**
- * Best-effort GPU % via Mali sysfs.
- * Returns null permanently once determined unavailable (avoids repeated IO).
- *
- * Paths tried (in order):
- *   /sys/class/misc/mali0/device/utilization
- *   /sys/devices/platform/[platform].mali/utilization  (first match via File.listFiles glob)
- *   /sys/kernel/gpu/gpu_busy
- *   /sys/class/kgsl/kgsl-3d0/gpubusy         (Adreno fallback)
- */
-private object GpuSampler {
-    // null = untried, true/false = determined
-    private var available: Boolean? = null
-    private var resolvedPath: String? = null
-
-    fun isUnavailable(): Boolean = available == false
-
-    private fun findPath(): String? {
-        val candidates = listOf(
-            "/sys/class/misc/mali0/device/utilization",
-            "/sys/kernel/gpu/gpu_busy",
-            "/sys/class/kgsl/kgsl-3d0/gpubusy",
-        )
-        for (path in candidates) {
-            val f = File(path)
-            if (f.exists() && f.canRead()) return path
-        }
-        // Platform glob: /sys/devices/platform/*.mali/utilization
-        try {
-            val platformDir = File("/sys/devices/platform")
-            platformDir.listFiles { f -> f.isDirectory && f.name.endsWith(".mali") }
-                ?.firstOrNull()
-                ?.let { mali ->
-                    val util = File(mali, "utilization")
-                    if (util.exists() && util.canRead()) return util.absolutePath
-                }
-        } catch (_: Exception) {}
-        return null
-    }
-
-    fun sample(): Float? {
-        if (available == false) return null
-        if (available == null) {
-            resolvedPath = findPath()
-            available = resolvedPath != null
-            if (available == false) return null
-        }
-        return try {
-            val raw = File(resolvedPath!!).readText().trim()
-            // Format may be "42" or "42 %" or "42/100" — extract first number
-            raw.split("\\s+|/".toRegex()).firstOrNull()?.toFloatOrNull()
-        } catch (_: Exception) {
-            available = false
-            null
-        }
-    }
-}
 
 class MainActivity : ComponentActivity() {
 
@@ -184,13 +127,12 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Generic live metric graph, reused for tok/s, RAM, CPU, GPU.
+     * Generic live metric graph, reused for tok/s, RAM, CPU.
      *
      * @param samples      list of sampled float values (mutableStateListOf)
      * @param label        e.g. "RAM (MB)"
      * @param unit         e.g. "MB" — shown in the placeholder text
      * @param primaryColor line / grid color
-     * @param unavailable  if true, show a "N/A" banner instead of the graph
      */
     @Composable
     fun LiveGraph(
@@ -199,7 +141,6 @@ class MainActivity : ComponentActivity() {
         unit: String,
         primaryColor: Color,
         modifier: Modifier = Modifier,
-        unavailable: Boolean = false,
     ) {
         val textMeasurer = rememberTextMeasurer()
 
@@ -213,13 +154,7 @@ class MainActivity : ComponentActivity() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(label, style = MaterialTheme.typography.labelSmall, color = primaryColor)
-                if (unavailable) {
-                    Text(
-                        "N/A — needs root",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outlineVariant,
-                    )
-                } else if (current != null && avg != null) {
+                if (current != null && avg != null) {
                     Text(
                         "now %.1f  avg %.1f %s".format(current, avg, unit),
                         style = MaterialTheme.typography.labelSmall,
@@ -232,17 +167,6 @@ class MainActivity : ComponentActivity() {
             val graphModifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-
-            if (unavailable) {
-                Box(modifier = graphModifier, contentAlignment = Alignment.Center) {
-                    Text(
-                        "GPU: N/A — permission denied (no root)",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outlineVariant,
-                    )
-                }
-                return@Column
-            }
 
             if (samples.isEmpty()) {
                 Box(modifier = graphModifier, contentAlignment = Alignment.Center) {
@@ -342,9 +266,6 @@ class MainActivity : ComponentActivity() {
         val tokSamples = remember { mutableStateListOf<Float>() }
         val ramSamples = remember { mutableStateListOf<Float>() }
         val cpuSamples = remember { mutableStateListOf<Float>() }
-        val gpuSamples = remember { mutableStateListOf<Float>() }
-        // Set to true once GpuSampler confirms unavailability
-        var gpuUnavailable by remember { mutableStateOf(false) }
 
         // Backend state
         var availableBackends by remember { mutableStateOf<List<BackendInfo>>(emptyList()) }
@@ -359,8 +280,6 @@ class MainActivity : ComponentActivity() {
 
         // Graphs collapsed by default
         var showGraphs by remember { mutableStateOf(false) }
-
-        val outputScrollState = rememberScrollState()
 
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
@@ -402,9 +321,13 @@ class MainActivity : ComponentActivity() {
 
         val hasGpuBackend = availableBackends.any { it.type == "gpu" || it.type == "igpu" }
 
-        // Build stats strip text
+        // Build stats strip text: tok/s · KV n · RAM MB · CPU% · ⚡backend
         val statsText = buildString {
             if (tokPerSec > 0f) append("%.1f tok/s".format(tokPerSec))
+            if (kvUsed > 0) {
+                if (isNotEmpty()) append(" · ")
+                append("KV $kvUsed")
+            }
             currentRamMb?.let { ram ->
                 if (isNotEmpty()) append(" · ")
                 append("%.0f MB".format(ram))
@@ -421,10 +344,11 @@ class MainActivity : ComponentActivity() {
 
         MaterialTheme {
             Surface(modifier = Modifier.fillMaxSize()) {
-                // Root column: NO verticalScroll — output takes weight(1f) + own scroll
+                // Root column: single global verticalScroll — no nested scroll
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -543,7 +467,6 @@ class MainActivity : ComponentActivity() {
                                 tokSamples.clear()
                                 ramSamples.clear()
                                 cpuSamples.clear()
-                                gpuSamples.clear()
                                 CpuSampler.reset()
                                 generating = true
                                 status = "Generating…"
@@ -591,7 +514,7 @@ class MainActivity : ComponentActivity() {
                                                     if (nowMs - lastSampleMs >= 400L) {
                                                         tokSamples.add(instantTokPerSec)
 
-                                                        // Sample RAM + CPU + GPU on IO dispatcher
+                                                        // Sample RAM + CPU on IO dispatcher
                                                         withContext(Dispatchers.IO) {
                                                             readRamMb()?.let { ramMb ->
                                                                 withContext(Dispatchers.Main) {
@@ -603,14 +526,6 @@ class MainActivity : ComponentActivity() {
                                                                 withContext(Dispatchers.Main) {
                                                                     cpuSamples.add(cpu)
                                                                     currentCpuPct = cpu
-                                                                }
-                                                            }
-                                                            val gpu = GpuSampler.sample()
-                                                            withContext(Dispatchers.Main) {
-                                                                if (GpuSampler.isUnavailable()) {
-                                                                    gpuUnavailable = true
-                                                                } else if (gpu != null) {
-                                                                    gpuSamples.add(gpu)
                                                                 }
                                                             }
                                                         }
@@ -709,32 +624,19 @@ class MainActivity : ComponentActivity() {
                                 primaryColor = Color(0xFFFF8F00),
                                 modifier = Modifier.fillMaxWidth().height(graphHeight),
                             )
-                            LiveGraph(
-                                samples = gpuSamples,
-                                label = "GPU (%)",
-                                unit = "%",
-                                primaryColor = Color(0xFFAB47BC),
-                                modifier = Modifier.fillMaxWidth().height(graphHeight),
-                                unavailable = gpuUnavailable,
-                            )
                         }
                     }
 
                     HorizontalDivider()
 
-                    // ── Output — weight(1f) + own verticalScroll ──────────────
-                    // Always visible, never cropped, scrollable independently.
-                    Box(
+                    // ── Output — plain content in the global scroll ───────────
+                    Text(
+                        text = output.ifEmpty { "(output will appear here)" },
+                        style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1f)
-                            .verticalScroll(outputScrollState),
-                    ) {
-                        Text(
-                            text = output.ifEmpty { "(output will appear here)" },
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
+                            .heightIn(min = 200.dp),
+                    )
                 }
             }
         }
