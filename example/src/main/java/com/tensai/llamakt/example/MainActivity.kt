@@ -43,6 +43,133 @@ private val PRESET_PROMPTS = listOf(
     "List 20 creative startup ideas, each with a one-line description.",
 )
 
+// ---------------------------------------------------------------------------
+// System metric helpers
+// ---------------------------------------------------------------------------
+
+/** Read VmRSS from /proc/self/status — resident set size in MB. IO thread only. */
+private fun readRamMb(): Float? = try {
+    File("/proc/self/status").bufferedReader().useLines { lines ->
+        lines.firstOrNull { it.startsWith("VmRSS:") }
+            ?.removePrefix("VmRSS:")
+            ?.trim()
+            ?.split("\\s+".toRegex())
+            ?.firstOrNull()
+            ?.toLongOrNull()
+            ?.let { kb -> kb / 1024f }
+    }
+} catch (_: Exception) { null }
+
+/**
+ * CPU % for this process, computed as:
+ *   delta_ticks / (CLK_TCK * delta_wall_seconds) * 100
+ *
+ * May exceed 100% on multi-threaded workloads — by design, not capped.
+ * CLK_TCK is typically 100 on Android (USER_HZ = 100).
+ *
+ * Returns null on first call (no previous snapshot) or on error.
+ */
+private object CpuSampler {
+    private val clkTck: Long = try {
+        android.system.Os.sysconf(android.system.OsConstants._SC_CLK_TCK)
+    } catch (_: Exception) { 100L }
+
+    private var prevTicks: Long = -1L
+    private var prevWallMs: Long = -1L
+
+    fun sample(): Float? {
+        return try {
+            val stat = File("/proc/self/stat").readText().trim()
+            // The second field (comm) can contain spaces wrapped in parens; find the closing ')' first.
+            val closeParenIdx = stat.lastIndexOf(')')
+            val fields = stat.substring(closeParenIdx + 2).trim().split(' ')
+            // After ')': state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime ...
+            // fields[0]=state, fields[11]=utime, fields[12]=stime
+            val utime = fields[11].toLong()
+            val stime = fields[12].toLong()
+            val totalTicks = utime + stime
+            val nowMs = System.currentTimeMillis()
+
+            val prev = prevTicks
+            val prevMs = prevWallMs
+            prevTicks = totalTicks
+            prevWallMs = nowMs
+
+            if (prev < 0L || prevMs < 0L) return null  // first call — no delta yet
+
+            val deltaTicks = totalTicks - prev
+            val deltaMs = nowMs - prevMs
+            if (deltaMs <= 0L) return null
+
+            val deltaWallSec = deltaMs / 1000.0
+            (deltaTicks.toDouble() / (clkTck * deltaWallSec) * 100.0).toFloat()
+        } catch (_: Exception) { null }
+    }
+
+    fun reset() {
+        prevTicks = -1L
+        prevWallMs = -1L
+    }
+}
+
+/**
+ * Best-effort GPU % via Mali sysfs.
+ * Returns null permanently once determined unavailable (avoids repeated IO).
+ *
+ * Paths tried (in order):
+ *   /sys/class/misc/mali0/device/utilization
+ *   /sys/devices/platform/[platform].mali/utilization  (first match via File.listFiles glob)
+ *   /sys/kernel/gpu/gpu_busy
+ *   /sys/class/kgsl/kgsl-3d0/gpubusy         (Adreno fallback)
+ */
+private object GpuSampler {
+    // null = untried, true/false = determined
+    private var available: Boolean? = null
+    private var resolvedPath: String? = null
+
+    fun isUnavailable(): Boolean = available == false
+
+    private fun findPath(): String? {
+        val candidates = listOf(
+            "/sys/class/misc/mali0/device/utilization",
+            "/sys/kernel/gpu/gpu_busy",
+            "/sys/class/kgsl/kgsl-3d0/gpubusy",
+        )
+        for (path in candidates) {
+            val f = File(path)
+            if (f.exists() && f.canRead()) return path
+        }
+        // Platform glob: /sys/devices/platform/*.mali/utilization
+        try {
+            val platformDir = File("/sys/devices/platform")
+            platformDir.listFiles { f -> f.isDirectory && f.name.endsWith(".mali") }
+                ?.firstOrNull()
+                ?.let { mali ->
+                    val util = File(mali, "utilization")
+                    if (util.exists() && util.canRead()) return util.absolutePath
+                }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    fun sample(): Float? {
+        if (available == false) return null
+        if (available == null) {
+            resolvedPath = findPath()
+            available = resolvedPath != null
+            if (available == false) return null
+        }
+        return try {
+            val raw = File(resolvedPath!!).readText().trim()
+            // Format may be "42" or "42 %" or "42/100" — extract first number
+            raw.split("\\s+|/".toRegex()).firstOrNull()?.toFloatOrNull()
+        } catch (_: Exception) {
+            available = false
+            null
+        }
+    }
+}
+
 class MainActivity : ComponentActivity() {
 
     private val engine = LlamaEngine()
@@ -57,95 +184,143 @@ class MainActivity : ComponentActivity() {
         engine.free()
     }
 
+    /**
+     * Generic live metric graph, reused for tok/s, RAM, CPU, GPU.
+     *
+     * @param samples      list of sampled float values (mutableStateListOf)
+     * @param label        e.g. "RAM (MB)"
+     * @param unit         e.g. "MB" — shown in the placeholder text
+     * @param primaryColor line / grid color
+     * @param unavailable  if true, show a "N/A" banner instead of the graph
+     */
     @Composable
-    fun LiveTokGraph(
+    fun LiveGraph(
         samples: List<Float>,
+        label: String,
+        unit: String,
         primaryColor: Color,
         modifier: Modifier = Modifier,
+        unavailable: Boolean = false,
     ) {
         val textMeasurer = rememberTextMeasurer()
 
-        if (samples.isEmpty()) {
-            Box(modifier = modifier, contentAlignment = Alignment.Center) {
-                Text(
-                    "(graph will appear during generation)",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outlineVariant,
-                )
-            }
-            return
-        }
-
-        Canvas(modifier = modifier) {
-            val w = size.width
-            val h = size.height
-            val padLeft = 48f   // room for Y labels
-            val padRight = 8f
-            val padTop = 8f
-            val padBottom = 24f // room for X hint
-
-            val graphW = w - padLeft - padRight
-            val graphH = h - padTop - padBottom
-
-            val maxVal = (samples.max() * 1.15f).coerceAtLeast(1f)
-
-            // Background grid — 3 horizontal lines
-            val gridColor = primaryColor.copy(alpha = 0.12f)
-            val labelColor = primaryColor.copy(alpha = 0.55f)
-            val gridSteps = 3
-            for (i in 0..gridSteps) {
-                val fy = padTop + graphH * (1f - i.toFloat() / gridSteps)
-                drawLine(gridColor, Offset(padLeft, fy), Offset(padLeft + graphW, fy), strokeWidth = 1f)
-
-                // Y label
-                val labelVal = maxVal * i / gridSteps
-                val labelText = if (labelVal >= 10f) "%.0f".format(labelVal) else "%.1f".format(labelVal)
-                val measured = textMeasurer.measure(
-                    labelText,
-                    style = TextStyle(fontSize = 9.sp, color = labelColor)
-                )
-                drawText(measured, topLeft = Offset(padLeft - measured.size.width - 4f, fy - measured.size.height / 2f))
-            }
-
-            // Polyline
-            if (samples.size >= 2) {
-                val path = Path()
-                samples.forEachIndexed { idx, v ->
-                    val x = padLeft + graphW * idx / (samples.size - 1).toFloat()
-                    val y = padTop + graphH * (1f - (v / maxVal).coerceIn(0f, 1f))
-                    if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        Column(modifier = modifier) {
+            // Label + current / avg row
+            val current = samples.lastOrNull()
+            val avg = if (samples.isNotEmpty()) samples.average().toFloat() else null
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(label, style = MaterialTheme.typography.labelSmall, color = primaryColor)
+                if (unavailable) {
+                    Text(
+                        "N/A — needs root",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                } else if (current != null && avg != null) {
+                    Text(
+                        "now %.1f  avg %.1f %s".format(current, avg, unit),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = primaryColor.copy(alpha = 0.75f),
+                    )
                 }
-                drawPath(path, color = primaryColor, style = Stroke(width = 2.5f))
-
-                // Last-point dot
-                val lastX = padLeft + graphW
-                val lastY = padTop + graphH * (1f - (samples.last() / maxVal).coerceIn(0f, 1f))
-                drawCircle(primaryColor, radius = 4f, center = Offset(lastX, lastY))
-            } else {
-                // Single point — just a dot
-                val x = padLeft + graphW / 2f
-                val y = padTop + graphH * (1f - (samples.first() / maxVal).coerceIn(0f, 1f))
-                drawCircle(primaryColor, radius = 4f, center = Offset(x, y))
             }
 
-            // Average line (dashed-ish via short segments)
-            val avg = samples.average().toFloat()
-            val avgY = padTop + graphH * (1f - (avg / maxVal).coerceIn(0f, 1f))
-            val dashLen = 6f
-            val gapLen = 4f
-            var x = padLeft
-            while (x < padLeft + graphW) {
-                val x2 = (x + dashLen).coerceAtMost(padLeft + graphW)
-                drawLine(primaryColor.copy(alpha = 0.35f), Offset(x, avgY), Offset(x2, avgY), strokeWidth = 1f)
-                x += dashLen + gapLen
+            // Graph area
+            val graphModifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+
+            if (unavailable) {
+                Box(modifier = graphModifier, contentAlignment = Alignment.Center) {
+                    Text(
+                        "GPU: N/A — permission denied (no root)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                }
+                return@Column
             }
-            // Avg label on the right
-            val avgText = "avg %.1f".format(avg)
-            val avgMeasured = textMeasurer.measure(
-                avgText,
-                style = TextStyle(fontSize = 9.sp, color = primaryColor.copy(alpha = 0.55f))
-            )
-            drawText(avgMeasured, topLeft = Offset(padLeft + graphW - avgMeasured.size.width - 2f, avgY - avgMeasured.size.height - 2f))
+
+            if (samples.isEmpty()) {
+                Box(modifier = graphModifier, contentAlignment = Alignment.Center) {
+                    Text(
+                        "(graph will appear during generation)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                    )
+                }
+                return@Column
+            }
+
+            Canvas(modifier = graphModifier) {
+                val w = size.width
+                val h = size.height
+                val padLeft = 48f
+                val padRight = 8f
+                val padTop = 4f
+                val padBottom = 4f
+
+                val graphW = w - padLeft - padRight
+                val graphH = h - padTop - padBottom
+
+                val maxVal = (samples.max() * 1.15f).coerceAtLeast(1f)
+
+                val gridColor = primaryColor.copy(alpha = 0.12f)
+                val labelColor = primaryColor.copy(alpha = 0.55f)
+                val gridSteps = 3
+                for (i in 0..gridSteps) {
+                    val fy = padTop + graphH * (1f - i.toFloat() / gridSteps)
+                    drawLine(gridColor, Offset(padLeft, fy), Offset(padLeft + graphW, fy), strokeWidth = 1f)
+                    val labelVal = maxVal * i / gridSteps
+                    val labelText = if (labelVal >= 10f) "%.0f".format(labelVal) else "%.1f".format(labelVal)
+                    val measured = textMeasurer.measure(
+                        labelText,
+                        style = TextStyle(fontSize = 9.sp, color = labelColor)
+                    )
+                    drawText(measured, topLeft = Offset(padLeft - measured.size.width - 4f, fy - measured.size.height / 2f))
+                }
+
+                // Polyline
+                if (samples.size >= 2) {
+                    val path = Path()
+                    samples.forEachIndexed { idx, v ->
+                        val x = padLeft + graphW * idx / (samples.size - 1).toFloat()
+                        val y = padTop + graphH * (1f - (v / maxVal).coerceIn(0f, 1f))
+                        if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                    drawPath(path, color = primaryColor, style = Stroke(width = 2.5f))
+
+                    val lastX = padLeft + graphW
+                    val lastY = padTop + graphH * (1f - (samples.last() / maxVal).coerceIn(0f, 1f))
+                    drawCircle(primaryColor, radius = 4f, center = Offset(lastX, lastY))
+                } else {
+                    val x = padLeft + graphW / 2f
+                    val y = padTop + graphH * (1f - (samples.first() / maxVal).coerceIn(0f, 1f))
+                    drawCircle(primaryColor, radius = 4f, center = Offset(x, y))
+                }
+
+                // Average dashed line
+                val avgVal = samples.average().toFloat()
+                val avgY = padTop + graphH * (1f - (avgVal / maxVal).coerceIn(0f, 1f))
+                val dashLen = 6f
+                val gapLen = 4f
+                var x = padLeft
+                while (x < padLeft + graphW) {
+                    val x2 = (x + dashLen).coerceAtMost(padLeft + graphW)
+                    drawLine(primaryColor.copy(alpha = 0.35f), Offset(x, avgY), Offset(x2, avgY), strokeWidth = 1f)
+                    x += dashLen + gapLen
+                }
+                val avgText = "avg %.1f".format(avgVal)
+                val avgMeasured = textMeasurer.measure(
+                    avgText,
+                    style = TextStyle(fontSize = 9.sp, color = primaryColor.copy(alpha = 0.55f))
+                )
+                drawText(avgMeasured, topLeft = Offset(padLeft + graphW - avgMeasured.size.width - 2f, avgY - avgMeasured.size.height - 2f))
+            }
         }
     }
 
@@ -164,20 +339,23 @@ class MainActivity : ComponentActivity() {
         var copying by remember { mutableStateOf(false) }
         var generationJob by remember { mutableStateOf<Job?>(null) }
 
-        // Live tok/s graph samples — instantaneous throughput via sliding window
+        // Live graph samples — each series reset at start of each Generate
         val tokSamples = remember { mutableStateListOf<Float>() }
+        val ramSamples = remember { mutableStateListOf<Float>() }
+        val cpuSamples = remember { mutableStateListOf<Float>() }
+        val gpuSamples = remember { mutableStateListOf<Float>() }
+        // Set to true once GpuSampler confirms unavailability
+        var gpuUnavailable by remember { mutableStateOf(false) }
 
         // Backend state
         var availableBackends by remember { mutableStateOf<List<BackendInfo>>(emptyList()) }
         var activeBackendStr by remember { mutableStateOf("") }
-        // Backend selector: true = GPU offload (nGpuLayers=99), false = CPU (nGpuLayers=0)
         var useGpu by remember { mutableStateOf(true) }
         val nGpuLayers by derivedStateOf { if (useGpu) 99 else 0 }
         val nCtx = 4096
 
         val scrollState = rememberScrollState()
 
-        // List backends at startup
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
                 try { engine.availableBackends() } catch (e: Exception) { emptyList() }
@@ -186,7 +364,6 @@ class MainActivity : ComponentActivity() {
             android.util.Log.i("MainActivity", "Available backends: $backends")
         }
 
-        // SAF picker: OpenDocument for any binary/mime
         val picker = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocument()
         ) { uri: Uri? ->
@@ -199,7 +376,6 @@ class MainActivity : ComponentActivity() {
 
             lifecycleScope.launch(Dispatchers.IO) {
                 try {
-                    // Copy content:// URI into cacheDir so llama.cpp can open it by path
                     val dest = File(cacheDir, "model.gguf")
                     contentResolver.openInputStream(uri)!!.use { input ->
                         dest.outputStream().use { output -> input.copyTo(output) }
@@ -228,7 +404,6 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Text("LlamaKt Bench", fontSize = 20.sp, style = MaterialTheme.typography.titleLarge)
 
-                    // Available backends list
                     if (availableBackends.isNotEmpty()) {
                         Text("Backends:", style = MaterialTheme.typography.labelSmall)
                         availableBackends.forEach { b ->
@@ -244,7 +419,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // Backend selector: CPU vs GPU
                     val hasGpuBackend = availableBackends.any { it.type == "gpu" || it.type == "igpu" }
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -280,7 +454,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // Active backend badge — shown after model load
                     if (activeBackendStr.isNotEmpty()) {
                         Text(
                             "Backend: $activeBackendStr",
@@ -289,7 +462,6 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    // Model picker
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = { picker.launch(arrayOf("*/*")) },
@@ -305,7 +477,6 @@ class MainActivity : ComponentActivity() {
                         Text("Model: ${File(it).name}", style = MaterialTheme.typography.bodySmall)
                     }
 
-                    // Preset prompt chips
                     Text("Presets:", style = MaterialTheme.typography.labelSmall)
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -326,7 +497,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // Prompt input
                     OutlinedTextField(
                         value = prompt,
                         onValueChange = { prompt = it },
@@ -335,7 +505,6 @@ class MainActivity : ComponentActivity() {
                         enabled = !generating
                     )
 
-                    // Generate / Stop
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
@@ -347,19 +516,21 @@ class MainActivity : ComponentActivity() {
                                 tokPerSec = 0f
                                 kvUsed = 0
                                 tokSamples.clear()
+                                ramSamples.clear()
+                                cpuSamples.clear()
+                                gpuSamples.clear()
+                                CpuSampler.reset()
                                 generating = true
                                 status = "Generating…"
 
                                 generationJob = lifecycleScope.launch {
                                     try {
-                                        // Load model if not already loaded (or backend changed)
                                         if (!modelLoaded) {
                                             status = "Loading model (nGpuLayers=$nGpuLayers)…"
                                             withContext(Dispatchers.IO) {
                                                 engine.load(path, nGpuLayers, nCtx)
                                             }
                                             modelLoaded = true
-                                            // Query active backend right after load
                                             activeBackendStr = withContext(Dispatchers.IO) {
                                                 engine.activeBackend()
                                             }
@@ -369,11 +540,9 @@ class MainActivity : ComponentActivity() {
                                         var tokenCount = 0
                                         val startMs = System.currentTimeMillis()
 
-                                        // Sliding window: keep timestamps of last N tokens for instantaneous tok/s
                                         val windowSize = 16
                                         val tokenTimestamps = ArrayDeque<Long>(windowSize + 1)
 
-                                        // Sampling: emit a graph point every ~400ms
                                         var lastSampleMs = 0L
 
                                         val messages = listOf(ChatMessage("user", prompt))
@@ -383,27 +552,43 @@ class MainActivity : ComponentActivity() {
 
                                             val nowMs = System.currentTimeMillis()
 
-                                            // Maintain sliding window of timestamps
                                             tokenTimestamps.addLast(nowMs)
                                             if (tokenTimestamps.size > windowSize) tokenTimestamps.removeFirst()
 
                                             val elapsedSec = (nowMs - startMs) / 1000f
                                             if (elapsedSec > 0f) tokPerSec = tokenCount / elapsedSec
 
-                                            // Compute instantaneous tok/s over the sliding window
                                             if (tokenTimestamps.size >= 2) {
                                                 val windowSec = (tokenTimestamps.last() - tokenTimestamps.first()) / 1000f
                                                 if (windowSec > 0f) {
                                                     val instantTokPerSec = (tokenTimestamps.size - 1) / windowSec
-                                                    // Emit a sample every ~400ms
+
                                                     if (nowMs - lastSampleMs >= 400L) {
                                                         tokSamples.add(instantTokPerSec)
+
+                                                        // Sample RAM + CPU + GPU on IO dispatcher
+                                                        withContext(Dispatchers.IO) {
+                                                            readRamMb()?.let { ramMb ->
+                                                                withContext(Dispatchers.Main) { ramSamples.add(ramMb) }
+                                                            }
+                                                            CpuSampler.sample()?.let { cpu ->
+                                                                withContext(Dispatchers.Main) { cpuSamples.add(cpu) }
+                                                            }
+                                                            val gpu = GpuSampler.sample()
+                                                            withContext(Dispatchers.Main) {
+                                                                if (GpuSampler.isUnavailable()) {
+                                                                    gpuUnavailable = true
+                                                                } else if (gpu != null) {
+                                                                    gpuSamples.add(gpu)
+                                                                }
+                                                            }
+                                                        }
+
                                                         lastSampleMs = nowMs
                                                     }
                                                 }
                                             }
 
-                                            // Sample KV usage every 10 tokens (avoid JNI spam)
                                             if (tokenCount % 10 == 0) {
                                                 kvUsed = engine.kvUsed()
                                             }
@@ -420,7 +605,7 @@ class MainActivity : ComponentActivity() {
                                         throw e
                                     } catch (e: Exception) {
                                         status = "Error: ${e.message}"
-                                        modelLoaded = false // force reload on next run
+                                        modelLoaded = false
                                     } finally {
                                         generating = false
                                     }
@@ -451,19 +636,49 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // Status line
                     Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
 
-                    // Live tok/s graph
-                    LiveTokGraph(
+                    // ── Live graphs ────────────────────────────────────────────
+                    val graphHeight = 100.dp
+
+                    // tok/s
+                    LiveGraph(
                         samples = tokSamples,
+                        label = "Tok/s",
+                        unit = "tok/s",
                         primaryColor = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(120.dp)
+                        modifier = Modifier.fillMaxWidth().height(graphHeight),
                     )
 
-                    // Output
+                    // RAM
+                    LiveGraph(
+                        samples = ramSamples,
+                        label = "RAM (MB)",
+                        unit = "MB",
+                        primaryColor = Color(0xFF43A047), // green
+                        modifier = Modifier.fillMaxWidth().height(graphHeight),
+                    )
+
+                    // CPU
+                    LiveGraph(
+                        samples = cpuSamples,
+                        label = "CPU (%)",
+                        unit = "%",
+                        primaryColor = Color(0xFFFF8F00), // amber
+                        modifier = Modifier.fillMaxWidth().height(graphHeight),
+                    )
+
+                    // GPU
+                    LiveGraph(
+                        samples = gpuSamples,
+                        label = "GPU (%)",
+                        unit = "%",
+                        primaryColor = Color(0xFFAB47BC), // purple
+                        modifier = Modifier.fillMaxWidth().height(graphHeight),
+                        unavailable = gpuUnavailable,
+                    )
+                    // ──────────────────────────────────────────────────────────
+
                     HorizontalDivider()
                     Text(
                         text = output.ifEmpty { "(output will appear here)" },
