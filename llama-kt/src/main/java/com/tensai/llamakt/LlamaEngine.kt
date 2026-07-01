@@ -1,5 +1,11 @@
 package com.tensai.llamakt
 
+import org.json.JSONArray
+import org.json.JSONObject
+
+/** A single message in a chat conversation. */
+data class ChatMessage(val role: String, val content: String)
+
 class LlamaEngine {
 
     private var handle: Long = 0L
@@ -52,12 +58,29 @@ class LlamaEngine {
     }
 
     /**
+     * Apply the model's built-in chat template (embedded in the GGUF) to
+     * [messages] and return the fully formatted prompt string.
+     * Works with any model — Qwen, Llama, Mistral, etc.
+     */
+    fun formatChat(messages: List<ChatMessage>): String {
+        val arr = JSONArray()
+        for (msg in messages) {
+            val obj = JSONObject()
+            obj.put("role", msg.role)
+            obj.put("content", msg.content)
+            arr.put(obj)
+        }
+        return nativeFormatChat(handle, arr.toString())
+    }
+
+    /**
      * Run a completion for [prompt], streaming tokens via [callback].
+     * [nPredict] caps the number of generated tokens (hard stop).
      * This is a blocking call — run it from a background thread or
      * use the [decode] Flow extension which handles that automatically.
      */
-    fun completion(prompt: String, callback: TokenCallback) =
-        nativeCompletion(handle, prompt, callback)
+    fun completion(prompt: String, nPredict: Int = 512, callback: TokenCallback) =
+        nativeCompletion(handle, prompt, nPredict, callback)
 
     // ------------------------------------------------------------------
     // JNI declarations — names and types must match tensai_jni.cpp exactly
@@ -65,7 +88,8 @@ class LlamaEngine {
 
     private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int): Long
     private external fun nativeFree(h: Long)
-    private external fun nativeCompletion(h: Long, prompt: String, cb: TokenCallback)
+    private external fun nativeCompletion(h: Long, prompt: String, nPredict: Int, cb: TokenCallback)
+    private external fun nativeFormatChat(h: Long, messagesJson: String): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int
     private external fun nativeInterrupt(h: Long)

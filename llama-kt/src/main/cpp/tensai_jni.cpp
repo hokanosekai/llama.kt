@@ -3,8 +3,8 @@
  *
  * Entry points:
  *   nativeLoadModel, nativeFree, nativeCompletion,
- *   nativeTokenize, nativeKvCacheUsedCells, nativeInterrupt,
- *   nativeSaveSession, nativeLoadSession
+ *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
+ *   nativeInterrupt, nativeSaveSession, nativeLoadSession
  *
  * KV used-cells strategy: this version of llama.cpp (b9769) exposes no
  * public llama_kv_self_used_cells() or llama_kv_self_n_tokens(). The
@@ -103,6 +103,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jobject /* thiz */,
         jlong   h,
         jstring prompt,
+        jint    nPredict,
         jobject cb)
 {
     if (h == 0L) return;
@@ -122,8 +123,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         return;
     }
 
-    // Set prompt and rewind completion state
+    // Set prompt, n_predict cap, and rewind completion state
     rnctx->params.prompt = jstring_to_std(env, prompt);
+    rnctx->params.n_predict = static_cast<int32_t>(nPredict > 0 ? nPredict : 512);
 
     auto* comp = rnctx->completion;
     comp->rewind();
@@ -156,6 +158,42 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     }
 
     env->DeleteLocalRef(cbClass);
+}
+
+// ---------------------------------------------------------------------------
+// nativeFormatChat
+// ---------------------------------------------------------------------------
+// Applies the model's built-in chat template (from GGUF metadata) to a JSON
+// array of messages: [{"role":"user","content":"..."},...]
+// Passing an empty chat_template string uses the template embedded in the GGUF.
+// Returns the fully formatted prompt string ready for completion.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring messagesJson)
+{
+    if (h == 0L) return env->NewStringUTF("");
+    auto* rnctx = to_ctx(h);
+
+    std::string msgs = jstring_to_std(env, messagesJson);
+
+    std::string formatted;
+    try {
+        // Pass empty chat_template → use the template stored in the GGUF via
+        // rnctx->templates (initialized from the model in loadModel).
+        // add_generation_prompt defaults to true in common_chat_templates_inputs,
+        // so the assistant prefix is automatically appended.
+        formatted = rnctx->getFormattedChat(msgs, /* chat_template= */ "");
+    } catch (const std::exception& e) {
+        LOGE("nativeFormatChat: exception: %s", e.what());
+        return env->NewStringUTF("");
+    }
+
+    LOGI("nativeFormatChat: formatted %zu chars", formatted.size());
+    return env->NewStringUTF(formatted.c_str());
 }
 
 // ---------------------------------------------------------------------------

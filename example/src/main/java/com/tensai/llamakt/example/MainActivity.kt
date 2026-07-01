@@ -16,8 +16,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.tensai.llamakt.ChatMessage
 import com.tensai.llamakt.LlamaEngine
-import com.tensai.llamakt.decode
+import com.tensai.llamakt.chat
 import kotlinx.coroutines.*
 import java.io.File
 
@@ -151,7 +152,8 @@ class MainActivity : ComponentActivity() {
                                         var tokenCount = 0
                                         val startMs = System.currentTimeMillis()
 
-                                        engine.decode(prompt).collect { token ->
+                                        val messages = listOf(ChatMessage("user", prompt))
+                                        engine.chat(messages).collect { token ->
                                             output += token
                                             tokenCount++
 
