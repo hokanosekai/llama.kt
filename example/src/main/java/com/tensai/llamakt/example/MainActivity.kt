@@ -654,7 +654,7 @@ class MainActivity : ComponentActivity() {
                             SamplingSlider(
                                 label = "Max tok",
                                 value = maxTokens,
-                                range = 16f..2048f,
+                                range = 16f..4096f,
                                 enabled = !generating,
                                 isInt = true,
                             ) { maxTokens = it }
