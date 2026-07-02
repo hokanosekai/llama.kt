@@ -300,6 +300,7 @@ class MainActivity : ComponentActivity() {
         // State
         var localPath by remember { mutableStateOf<String?>(null) }
         var modelDisplayName by remember { mutableStateOf<String?>(null) }
+        var modelMeta by remember { mutableStateOf<com.tensai.llamakt.GgufMetadata?>(null) }
         var modelLoaded by remember { mutableStateOf(false) }
         var prompt by remember { mutableStateOf("Hello, who are you?") }
         var output by remember { mutableStateOf("") }
@@ -384,15 +385,9 @@ class MainActivity : ComponentActivity() {
                     localPath = dest.absolutePath
                     val meta = LlamaEngine.readMetadata(dest.absolutePath)
                     withContext(Dispatchers.Main) {
-                        status = if (meta != null) {
-                            "%s · %s · %.1fB params · ctx %d · %d MB. Ready.".format(
-                                meta.architecture, meta.quantLabel,
-                                meta.paramCount / 1e9, meta.contextLength,
-                                meta.fileSizeBytes / 1_048_576,
-                            )
-                        } else {
-                            "Copied → $displayName (${dest.length() / 1_048_576} MB). Ready (not a readable GGUF?)."
-                        }
+                        modelMeta = meta
+                        status = if (meta != null) "Ready."
+                                 else "Copied → $displayName (${dest.length() / 1_048_576} MB). Ready (not a readable GGUF?)."
                         copying = false
                     }
                 } catch (e: Exception) {
@@ -467,6 +462,18 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.weight(1f),
                             )
                         }
+                    }
+
+                    // ── Persistent model card (survives generation) ───────────
+                    modelMeta?.let { m ->
+                        Text(
+                            "%s · %s · %.2fB params · ctx %d · %d layers · %d MB".format(
+                                m.architecture, m.quantLabel, m.paramCount / 1e9,
+                                m.contextLength, m.blockCount, m.fileSizeBytes / 1_048_576,
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.tertiary,
+                        )
                     }
 
                     // ── Segmented backend selector (ONLY backend control) ──────
@@ -802,6 +809,7 @@ class MainActivity : ComponentActivity() {
                                 if (intent.hasExtra("temp")) temperature = intent.getFloatExtra("temp", 0.8f)
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 LlamaEngine.readMetadata(cached.absolutePath)?.let { m ->
+                                    modelMeta = m
                                     android.util.Log.i("LlamaKtBench", "metadata: arch=${m.architecture} name=${m.name} quant=${m.quantLabel} params=${m.paramCount} ctx=${m.contextLength} embd=${m.embeddingLength} layers=${m.blockCount} vocab=${m.vocabSize} size=${m.fileSizeBytes}")
                                 }
                                 startGeneration()
