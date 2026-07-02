@@ -75,13 +75,23 @@ class LlamaEngine {
      * Load a GGUF model from [path].
      * [nGpuLayers] = 0 → CPU only; > 0 → offload layers to GPU (Vulkan on Mali).
      * [nCtx] = context window size (tokens). Defaults to 4096.
-     * [nThreads] = CPU inference threads. 0 → llama.cpp auto-detect. On
-     *   big.LITTLE SoCs, matching the number of big cores (e.g. 2 on a
-     *   2×A78 + 6×A55 chip) can beat auto — slow cores drag the pool down.
+     * [nThreads] = CPU inference threads.
+     *   0 (default) → pin to the number of big cores ([detectBigCoreCount]).
+     *     On big.LITTLE SoCs slow cores drag the whole pool down — measured
+     *     on a 2×A78+6×A55 chip, llama.cpp's own auto was up to 6× slower
+     *     than big-core pinning. Falls back to llama.cpp auto if sysfs
+     *     detection fails.
+     *   -1 → force llama.cpp auto-detect.
+     *   > 0 → explicit thread count.
      * Throws [IllegalStateException] if the native load fails.
      */
     fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0) {
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, nThreads)
+        val resolved = when {
+            nThreads > 0 -> nThreads
+            nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
+            else -> 0                              // -1 → llama auto
+        }
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -173,5 +183,30 @@ class LlamaEngine {
         init {
             System.loadLibrary("llamakt")
         }
+
+        /**
+         * Count the "big" cores of a big.LITTLE SoC: cores whose
+         * cpuinfo_max_freq is at least 85% of the fastest core's.
+         * The 85% cutoff separates efficiency cores (e.g. A55 at 2.0GHz
+         * vs A78 at 2.4GHz = 83%) while keeping mid cores on 3-tier SoCs
+         * (e.g. A78 at 2.6GHz vs X1 at 3.0GHz = 87%).
+         * Returns 0 if sysfs is unreadable (caller should fall back to auto).
+         */
+        fun detectBigCoreCount(): Int = try {
+            val freqs = java.io.File("/sys/devices/system/cpu")
+                .listFiles { f -> f.name.matches(Regex("cpu\\d+")) }
+                ?.mapNotNull { cpu ->
+                    runCatching {
+                        java.io.File(cpu, "cpufreq/cpuinfo_max_freq")
+                            .readText().trim().toLong()
+                    }.getOrNull()
+                }
+                .orEmpty()
+            if (freqs.isEmpty()) 0
+            else {
+                val max = freqs.max()
+                freqs.count { it * 100 >= max * 85 }
+            }
+        } catch (_: Exception) { 0 }
     }
 }

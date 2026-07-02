@@ -600,13 +600,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // ── Generate / Stop ───────────────────────────────────────
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
+                    // Generation logic, shared by the Generate button and the
+                    // adb autorun path (see LaunchedEffect below).
+                    val startGeneration: () -> Unit = startGeneration@{
                                 val path = localPath ?: run {
                                     status = "No model loaded. Pick a GGUF first."
-                                    return@Button
+                                    return@startGeneration
                                 }
                                 output = ""
                                 tokPerSec = 0f
@@ -700,6 +699,11 @@ class MainActivity : ComponentActivity() {
                                         kvUsed = engine.kvUsed()
                                         status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s) [$activeBackendStr]"
                                             .format(elapsedSec, tokPerSec)
+                                        android.util.Log.i(
+                                            "LlamaKtBench",
+                                            "bench: threads=${if (nThreads == 0) "auto" else nThreads} backend=$activeBackendStr " +
+                                                "tokens=$tokenCount elapsed=%.1fs tok/s=%.2f model=$modelDisplayName".format(elapsedSec, tokPerSec),
+                                        )
 
                                     } catch (e: CancellationException) {
                                         status = "Interrupted."
@@ -711,7 +715,33 @@ class MainActivity : ComponentActivity() {
                                         generating = false
                                     }
                                 }
-                            },
+                    }
+
+                    // Headless autorun for adb-driven repro loops:
+                    //   adb shell am start -n com.tensai.llamakt.example/.MainActivity \
+                    //     --ez autorun true --ez gpu true [--es prompt "..."]
+                    // Reuses cacheDir/model.gguf from a previous pick (or a
+                    // run-as push) — SAF picking is not adb-scriptable.
+                    LaunchedEffect(Unit) {
+                        if (intent?.getBooleanExtra("autorun", false) == true) {
+                            val cached = File(cacheDir, "model.gguf")
+                            if (cached.exists()) {
+                                localPath = cached.absolutePath
+                                modelDisplayName = "model.gguf (autorun)"
+                                useGpu = intent.getBooleanExtra("gpu", true)
+                                intent.getStringExtra("prompt")?.let { prompt = it }
+                                android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
+                                startGeneration()
+                            } else {
+                                status = "autorun: no cached model.gguf"
+                            }
+                        }
+                    }
+
+                    // ── Generate / Stop ───────────────────────────────────────
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = startGeneration,
                             enabled = !generating && !copying && localPath != null,
                         ) { Text("Generate") }
 
