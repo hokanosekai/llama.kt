@@ -479,6 +479,30 @@ fi
 find "$CPP_DIR" -name "*.orig" -delete
 
 # ---------------------------------------------------------------------------
+# Apply local patches (ours, from patches/ at repo root)
+# Unlike the llama.rn patches above, these MUST apply: they carry fixes the
+# lib depends on (e.g. the Vulkan UMA descriptor fix, upstream #23057).
+# If one fails after a submodule bump, update the patch deliberately —
+# do not skip it.
+# ---------------------------------------------------------------------------
+echo "==> Applying local patches (patches/)..."
+if [ -d "$ROOT_DIR/patches" ]; then
+  for patch_file in "$ROOT_DIR/patches"/*.patch; do
+    [ -f "$patch_file" ] || continue
+    echo "  Applying local patch: $(basename $patch_file)"
+    if git -C "$ROOT_DIR" apply --check "$patch_file" 2>/dev/null; then
+      git -C "$ROOT_DIR" apply "$patch_file"
+    elif git -C "$ROOT_DIR" apply --reverse --check "$patch_file" 2>/dev/null; then
+      echo "  Already applied, skipping."
+    else
+      echo "  ERROR: local patch $(basename $patch_file) does not apply."
+      echo "  The vendored sources changed (submodule bump?) — update the patch."
+      exit 1
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
 # Generate build-info.cpp
 # ---------------------------------------------------------------------------
 echo "==> Generating build-info.cpp..."

@@ -1,0 +1,57 @@
+diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
+index 507d948..49b92be 100644
+--- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
++++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
+@@ -2628,6 +2628,10 @@ static void lm_ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipelin
+ static void lm_ggml_pipeline_request_descriptor_sets(lm_ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n) {
+     VK_LOG_DEBUG("lm_ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
+     ctx->pipeline_descriptor_set_requirements += n;
++#ifdef LM_GGML_VULKAN_DEBUG_DESCRIPTOR_ACCOUNTING
++    LM_GGML_LOG_ERROR("DSACC req  %s n=%u total_req=%u\n",
++        pipeline->name.c_str(), n, ctx->pipeline_descriptor_set_requirements);
++#endif
+     if (!pipeline->compiled) {
+         lm_ggml_vk_load_shaders(ctx->device, pipeline);
+     }
+@@ -7400,6 +7404,18 @@ static void lm_ggml_vk_dispatch_pipeline(lm_ggml_backend_vk_context* ctx, vk_con
+     LM_GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
++#ifdef LM_GGML_VULKAN_DEBUG_DESCRIPTOR_ACCOUNTING
++    LM_GGML_LOG_ERROR("DSACC disp %s idx=%u size=%zu req=%u\n",
++        pipeline->name.c_str(), ctx->descriptor_set_idx,
++        ctx->descriptor_sets.size(), ctx->pipeline_descriptor_set_requirements);
++#endif
++    if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
++        // Diagnostic for upstream #23057: identify which pipeline dispatches
++        // without a matching request_descriptor_sets() call.
++        LM_GGML_LOG_ERROR("%s: descriptor set pool exhausted: pipeline=%s idx=%u size=%zu requirements=%u\n",
++            __func__, pipeline->name.c_str(), ctx->descriptor_set_idx,
++            ctx->descriptor_sets.size(), ctx->pipeline_descriptor_set_requirements);
++    }
+     LM_GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+     LM_GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
+     LM_GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
+@@ -8042,7 +8058,11 @@ static void lm_ggml_vk_matmul(
+         uint32_t padded_n) {
+         VK_LOG_DEBUG("lm_ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+     if (split_k == 1) {
+-        lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
++        // Promote to 64-bit: some mobile drivers (Mali, Adreno) report
++        // maxComputeWorkGroupCount = UINT32_MAX, which makes the 32-bit
++        // CEIL_DIV numerator (batch + N - 1) wrap and yield 0 for batch >= 2,
++        // under-requesting descriptor sets (upstream #23057).
++        lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(uint64_t{batch}, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
+ 
+         uint32_t base_work_group_z = 0;
+         while (base_work_group_z < batch) {
+@@ -8065,7 +8085,8 @@ static void lm_ggml_vk_matmul(
+     uint32_t k_split = CEIL_DIV(k, split_k);
+     k_split = ROUNDUP_POW2(k_split, 256);
+ 
+-    lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
++    // 64-bit promotion: see the comment on the split_k == 1 branch above.
++    lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(uint64_t{batch}, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
+ 
+     uint32_t base_work_group_z = 0;
+     while (base_work_group_z < batch) {

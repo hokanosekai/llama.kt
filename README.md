@@ -17,7 +17,7 @@ Working. Validated on-device (OPPO / MediaTek Dimensity 900, arm64): loads a GGU
 
 Multimodal (vision via `mtmd`) is vendored but not yet wired through the Kotlin API.
 
-**Vulkan UMA fix.** Mobile drivers (Mali, Adreno, CIX) report `maxComputeWorkGroupCount = UINT32_MAX`, which overflows a 32-bit `CEIL_DIV` in `ggml_vk_matmul` and under-requests descriptor sets — batched matmuls (Gemma 3n and others) then abort at model load ([upstream #23057](https://github.com/ggml-org/llama.cpp/issues/23057)). The vendored `ggml-vulkan.cpp` in this repo carries a 2-line 64-bit promotion fix, validated on Mali-G68. **Warning: re-running `bootstrap.sh` regenerates the vendored sources and drops this fix** until it lands upstream or bootstrap gains a patch step.
+**Vulkan UMA fix.** Mobile drivers (Mali, Adreno, CIX) report `maxComputeWorkGroupCount = UINT32_MAX`, which overflows a 32-bit `CEIL_DIV` in `ggml_vk_matmul` and under-requests descriptor sets — batched matmuls (Gemma 3n and others) then abort at model load ([upstream #23057](https://github.com/ggml-org/llama.cpp/issues/23057)). The vendored `ggml-vulkan.cpp` in this repo carries a 2-line 64-bit promotion fix, validated on Mali-G68. The fix lives in [`patches/`](patches/) and is re-applied automatically by `bootstrap.sh`; it can be dropped once it lands upstream.
 
 **CPU threads.** `load()` defaults to pinning inference threads to the big cores (detected via `cpuinfo_max_freq`). On big.LITTLE SoCs this measured up to 6× faster than llama.cpp's auto-detect, which lets efficiency cores drag the pool down.
 
@@ -140,8 +140,8 @@ bash scripts/build-opencl.sh
 
 The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mtmd.hpp` + the `ggml-opencl/` backend. We extract files, not fork the repo (avoids merge conflicts from the JS side). To pull upstream changes: bump the `third_party/llama.cpp` submodule deliberately (breaking API changes are frequent), re-run `bootstrap.sh`, port relevant `rn-*` changes from a fresh llama.rn checkout, rebuild. The `cpp/jsi/` React Native adapter is intentionally dropped.
 
-**Local patches on vendored code** (lost if you re-run `bootstrap.sh` — re-apply manually until bootstrap gains a patch step):
-- `ggml-vulkan/ggml-vulkan.cpp`: 64-bit `CEIL_DIV` promotion in `ggml_vk_matmul` descriptor set requests + diagnostic log before the pool assert (fixes [#23057](https://github.com/ggml-org/llama.cpp/issues/23057) on UMA GPUs).
+**Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
+- `0001-vulkan-uma-descriptor-ceildiv.patch`: 64-bit `CEIL_DIV` promotion in `ggml_vk_matmul` descriptor set requests + diagnostic log before the pool assert (fixes [#23057](https://github.com/ggml-org/llama.cpp/issues/23057) on UMA GPUs).
 
 ## Roadmap
 
@@ -149,7 +149,6 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 - **Runtime backend auto-selection** — pick Vulkan / OpenCL / CPU per device automatically, with a manual override.
 - **CPU per-feature dispatch** — ship multiple CPU variants (baseline / dotprod / i8mm / SVE) and select at runtime, to keep i8mm speed on capable cores without crashing older ones.
 - **Multimodal** — wire the vendored `mtmd` (vision) through the Kotlin API.
-- **Patch step in bootstrap** — keep local fixes to vendored code (Vulkan UMA fix) as `patches/*.patch` applied automatically, so `bootstrap.sh` stops silently dropping them.
 
 ## License
 
