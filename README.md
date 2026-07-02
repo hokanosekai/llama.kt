@@ -44,6 +44,8 @@ What the numbers say for this device class (UMA, no GPU matrix cores):
 - **Partial GPU offload always loses** on UMA: every tested split (8/16/24 of 30 layers) was slower than either full CPU or full GPU, because graph-split synchronization costs more than the shared-memory GPU brings.
 - **KV cache q8_0** helps decode on the bandwidth-bound GPU for Gemma (+7%), costs ~13% on CPU, and is neutral-to-negative elsewhere. It requires flash attention (quantized V cache), so never combine it with `flashAttn = "off"`.
 
+**Reference point — Google AI Edge Gallery** (LiteRT-LM, same device, same prompt, Gemma 3n E2B-it, runtime-selected CPU): ~2.4–3.0 tok/s estimated from the on-screen timer and word counts (the app does not report tok/s; timer includes prefill, token counts estimated, int4 LiteRT quant vs our Q4). Google's vertical stack for its own model family runs ~1.3× our best GGUF config on this hardware — the price of running arbitrary GGUFs instead of one compiled model format.
+
 ## Requirements
 
 - Android NDK r27+, `arm64-v8a` (only ABI targeted)
