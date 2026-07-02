@@ -125,6 +125,9 @@ class LlamaEngine {
      * [kvCacheType] — KV cache quantization: null → f16 (default), "q8_0" →
      *   half the cache memory (double the context in the same RAM), "q4_0" →
      *   quarter (quality risk). Applied to both K and V.
+     * [flashAttn] — flash attention: null → auto (llama.cpp decides), "on",
+     *   "off". On GPUs without matrix cores (Mali) the generic FA path can
+     *   cost instead of help — worth benchmarking per device.
      * Throws [IllegalStateException] if the native load fails or is aborted.
      */
     fun load(
@@ -134,13 +137,14 @@ class LlamaEngine {
         nThreads: Int = 0,
         onProgress: LoadProgressCallback? = null,
         kvCacheType: String? = null,
+        flashAttn: String? = null,
     ) {
         val resolved = when {
             nThreads > 0 -> nThreads
             nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
             else -> 0                              // -1 → llama auto
         }
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType)
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType, flashAttn)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -217,7 +221,7 @@ class LlamaEngine {
     private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(
         path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int,
-        progressCb: LoadProgressCallback?, kvCacheType: String?,
+        progressCb: LoadProgressCallback?, kvCacheType: String?, flashAttn: String?,
     ): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(

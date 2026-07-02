@@ -280,7 +280,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jint nCtx,
         jint nThreads,
         jobject progressCb,
-        jstring kvCacheType)
+        jstring kvCacheType,
+        jstring flashAttn)
 {
     auto* rnctx = new rnllama::llama_rn_context();
 
@@ -304,6 +305,12 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
     if (!kv_type.empty()) {
         p.cache_type_k = rnllama::kv_cache_type_from_str(kv_type);
         p.cache_type_v = rnllama::kv_cache_type_from_str(kv_type);
+    }
+
+    // Flash attention: "on"/"off"; anything else keeps AUTO
+    const std::string fa = jstring_to_std(env, flashAttn);
+    if (!fa.empty()) {
+        p.flash_attn_type = rnllama::flash_attn_type_from_str(fa);
     }
 
     LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d kv_cache=%s",

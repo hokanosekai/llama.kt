@@ -320,7 +320,9 @@ class MainActivity : ComponentActivity() {
         var availableBackends by remember { mutableStateOf<List<BackendInfo>>(emptyList()) }
         var activeBackendStr by remember { mutableStateOf("") }
         var useGpu by remember { mutableStateOf(true) }
-        val nGpuLayers by derivedStateOf { if (useGpu) 99 else 0 }
+        // -1 = derive from useGpu; >= 0 = explicit layer count (autorun extra "ngl")
+        var nglOverride by remember { mutableStateOf(-1) }
+        val nGpuLayers by derivedStateOf { if (nglOverride >= 0) nglOverride else if (useGpu) 99 else 0 }
         val nCtx = 4096
 
         // CPU threads: 0 = llama.cpp auto. Load-time param — changing forces reload.
@@ -328,6 +330,9 @@ class MainActivity : ComponentActivity() {
 
         // KV cache type: null = f16. Settable via autorun extra "kv" (e.g. "q8_0").
         var kvCacheType by remember { mutableStateOf<String?>(null) }
+
+        // Flash attention: null = auto. Settable via autorun extra "fa" ("on"/"off").
+        var flashAttn by remember { mutableStateOf<String?>(null) }
 
         // Live metric snapshots for stats strip
         var currentRamMb by remember { mutableStateOf<Float?>(null) }
@@ -698,7 +703,7 @@ class MainActivity : ComponentActivity() {
                                                         status = "Loading model… ${(p * 100).toInt()}%"
                                                         true
                                                     },
-                                                    kvCacheType)
+                                                    kvCacheType, flashAttn)
                                             }
                                             modelLoaded = true
                                             activeBackendStr = withContext(Dispatchers.IO) {
@@ -785,11 +790,19 @@ class MainActivity : ComponentActivity() {
                                         status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s) [$activeBackendStr]"
                                             .format(elapsedSec, tokPerSec)
                                         val ttftMs = if (firstTokenMs > 0L) firstTokenMs - startMs else -1L
+                                        // Prompt size = KV used minus generated tokens; prefill
+                                        // speed = prompt tokens / time to first token. Decode
+                                        // speed excludes the prefill window entirely.
+                                        val promptTokens = (kvUsed - tokenCount).coerceAtLeast(0)
+                                        val prefillTokS = if (ttftMs > 0) promptTokens * 1000f / ttftMs else 0f
+                                        val decodeTokS = if (elapsedSec > ttftMs / 1000f && tokenCount > 1)
+                                            (tokenCount - 1) / (elapsedSec - ttftMs / 1000f) else 0f
                                         android.util.Log.i(
                                             "LlamaKtBench",
-                                            "bench: threads=${if (nThreads == 0) "auto" else nThreads} backend=$activeBackendStr " +
-                                                "kv=${kvCacheType ?: "f16"} " +
-                                                "tokens=$tokenCount ttft=${ttftMs}ms elapsed=%.1fs tok/s=%.2f model=$modelDisplayName".format(elapsedSec, tokPerSec),
+                                            "bench: threads=${if (nThreads == 0) "auto" else nThreads} ngl=$nGpuLayers backend=$activeBackendStr " +
+                                                "kv=${kvCacheType ?: "f16"} fa=${flashAttn ?: "auto"} " +
+                                                "pp=$promptTokens pp_tok/s=%.1f ttft=${ttftMs}ms tokens=$tokenCount tg_tok/s=%.2f elapsed=%.1fs model=$modelDisplayName"
+                                                    .format(prefillTokS, decodeTokS, elapsedSec),
                                         )
 
                                         if (autorunSaveSession) {
@@ -829,6 +842,8 @@ class MainActivity : ComponentActivity() {
                                 autorunLoadSession = intent.getBooleanExtra("load", false)
                                 kvCacheType = intent.getStringExtra("kv")
                                 if (intent.hasExtra("temp")) temperature = intent.getFloatExtra("temp", 0.8f)
+                                if (intent.hasExtra("ngl")) nglOverride = intent.getIntExtra("ngl", -1)
+                                flashAttn = intent.getStringExtra("fa")
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 LlamaEngine.readMetadata(cached.absolutePath)?.let { m ->
                                     modelMeta = m
