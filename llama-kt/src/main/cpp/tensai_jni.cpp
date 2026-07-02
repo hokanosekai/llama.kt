@@ -235,6 +235,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jfloat  temperature,
         jint    topK,
         jfloat  topP,
+        jfloat  minP,
+        jobjectArray stopSequences,
         jobject cb)
 {
     if (h == 0L) return;
@@ -259,16 +261,31 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     rnctx->params.n_predict = static_cast<int32_t>(nPredict > 0 ? nPredict : 512);
 
     // Sampling parameters — read by common_sampler_init() inside initSampling().
-    // temp <= 0 → greedy decoding; topK 0 / topP 1.0 disable those filters.
+    // temp <= 0 → greedy decoding; topK 0 / topP 1.0 / minP 0 disable those filters.
     rnctx->params.sampling.temp  = static_cast<float>(temperature);
     rnctx->params.sampling.top_k = static_cast<int32_t>(topK);
     rnctx->params.sampling.top_p = static_cast<float>(topP);
-    LOGI("nativeCompletion: n_predict=%d temp=%.2f top_k=%d top_p=%.2f",
+    rnctx->params.sampling.min_p = static_cast<float>(minP);
+    LOGI("nativeCompletion: n_predict=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f",
          rnctx->params.n_predict, rnctx->params.sampling.temp,
-         rnctx->params.sampling.top_k, rnctx->params.sampling.top_p);
+         rnctx->params.sampling.top_k, rnctx->params.sampling.top_p,
+         rnctx->params.sampling.min_p);
 
     auto* comp = rnctx->completion;
-    comp->rewind();
+    comp->rewind();  // clears params.antiprompt — set stop sequences after this
+
+    // Stop sequences → antiprompt, checked via findStoppingStrings() below
+    const jsize n_stops = stopSequences ? env->GetArrayLength(stopSequences) : 0;
+    for (jsize i = 0; i < n_stops; i++) {
+        auto js = (jstring) env->GetObjectArrayElement(stopSequences, i);
+        std::string s = jstring_to_std(env, js);
+        env->DeleteLocalRef(js);
+        if (!s.empty()) rnctx->params.antiprompt.push_back(std::move(s));
+    }
+    const bool has_stops = !rnctx->params.antiprompt.empty();
+    if (has_stops) {
+        LOGI("nativeCompletion: %d stop sequences", (int) rnctx->params.antiprompt.size());
+    }
 
     if (!comp->initSampling()) {
         LOGE("nativeCompletion: initSampling failed");
@@ -282,6 +299,19 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     // Begin generation
     comp->beginCompletion();
 
+    auto emit = [&](const std::string& s) {
+        if (s.empty()) return;
+        jstring jtok = env->NewStringUTF(s.c_str());
+        env->CallVoidMethod(cb, onToken, jtok);
+        env->DeleteLocalRef(jtok);
+    };
+
+    // With stop sequences, tokens are staged in `pending` and only emitted
+    // once they can no longer be part of a stop word (a stop can span
+    // several tokens). On a full match, everything from the match start
+    // is dropped so the stream never contains the stop sequence.
+    std::string pending;
+
     while (comp->has_next_token && !comp->is_interrupted) {
         rnllama::completion_token_output tok_out = comp->doCompletion();
 
@@ -290,11 +320,41 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         }
 
         const std::string& text = tok_out.text;
-        if (!text.empty()) {
-            jstring jtok = env->NewStringUTF(text.c_str());
-            env->CallVoidMethod(cb, onToken, jtok);
-            env->DeleteLocalRef(jtok);
+
+        if (!has_stops) {
+            emit(text);
+            continue;
         }
+
+        pending += text;
+
+        // Full stop word in the generated text? (doCompletion already
+        // appended `text` to comp->generated_text.)
+        size_t stop_pos = comp->findStoppingStrings(comp->generated_text, text.size(), rnllama::STOP_FULL);
+        if (comp->stopped_word) {
+            const size_t tail_after_stop = comp->generated_text.size() - stop_pos;
+            if (pending.size() >= tail_after_stop) {
+                emit(pending.substr(0, pending.size() - tail_after_stop));
+            }
+            pending.clear();
+            break;  // has_next_token was set false by findStoppingStrings
+        }
+
+        // Partial stop match at the tail: hold back only the matching suffix
+        size_t partial_pos = comp->findStoppingStrings(pending, 0, rnllama::STOP_PARTIAL);
+        if (partial_pos == std::string::npos) {
+            emit(pending);
+            pending.clear();
+        } else if (partial_pos > 0) {
+            emit(pending.substr(0, partial_pos));
+            pending.erase(0, partial_pos);
+        }
+    }
+
+    // Generation ended without a stop match (EOS / n_predict / interrupt):
+    // flush whatever was held back.
+    if (!pending.empty() && !comp->is_interrupted) {
+        emit(pending);
     }
 
     env->DeleteLocalRef(cbClass);

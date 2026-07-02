@@ -91,6 +91,8 @@ data class SamplingParams(
     val temperature: Float = 0.8f, // 0 = greedy/deterministic
     val topK: Int = 40,            // 0 = disabled
     val topP: Float = 0.95f,       // 1.0 = disabled
+    val minP: Float = 0.05f,       // 0 = disabled
+    val stopSequences: List<String> = emptyList(),  // never emitted to the stream
 )
 
 data class ChatMessage(val role: String, val content: String)

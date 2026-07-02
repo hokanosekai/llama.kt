@@ -16,6 +16,11 @@ data class ChatMessage(val role: String, val content: String)
  *   0 disables the filter. Default 40.
  * [topP] — nucleus sampling: keep the smallest set of tokens whose
  *   cumulative probability reaches P. 1.0 disables the filter. Default 0.95.
+ * [minP] — drop tokens whose probability is below minP times the top
+ *   token's probability. 0 disables the filter. Default 0.05.
+ * [stopSequences] — strings that end generation when they appear in the
+ *   output. The matched sequence is not emitted (partial matches are held
+ *   back until resolved), so the stream stays clean.
  *
  * Defaults match llama.cpp's common_params_sampling.
  */
@@ -24,6 +29,8 @@ data class SamplingParams(
     val temperature: Float = 0.8f,
     val topK: Int = 40,
     val topP: Float = 0.95f,
+    val minP: Float = 0.05f,
+    val stopSequences: List<String> = emptyList(),
 )
 
 /**
@@ -155,7 +162,8 @@ class LlamaEngine {
         callback: TokenCallback,
     ) = nativeCompletion(
         handle, prompt,
-        params.nPredict, params.temperature, params.topK, params.topP,
+        params.nPredict, params.temperature, params.topK, params.topP, params.minP,
+        params.stopSequences.toTypedArray(),
         callback,
     )
 
@@ -169,7 +177,8 @@ class LlamaEngine {
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
         h: Long, prompt: String,
-        nPredict: Int, temperature: Float, topK: Int, topP: Float,
+        nPredict: Int, temperature: Float, topK: Int, topP: Float, minP: Float,
+        stopSequences: Array<String>,
         cb: TokenCallback,
     )
     private external fun nativeFormatChat(h: Long, messagesJson: String): String

@@ -337,6 +337,8 @@ class MainActivity : ComponentActivity() {
         var temperature by remember { mutableStateOf(0.8f) }
         var topK by remember { mutableStateOf(40f) }
         var topP by remember { mutableStateOf(0.95f) }
+        // Settable via the autorun intent extra "stops" (no UI control)
+        var stopSequences by remember { mutableStateOf<List<String>>(emptyList()) }
 
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
@@ -647,6 +649,7 @@ class MainActivity : ComponentActivity() {
                                             temperature = temperature,
                                             topK = topK.toInt(),
                                             topP = topP,
+                                            stopSequences = stopSequences,
                                         )
                                         engine.chat(messages, sampling).collect { token ->
                                             output += token
@@ -730,6 +733,7 @@ class MainActivity : ComponentActivity() {
                                 modelDisplayName = "model.gguf (autorun)"
                                 useGpu = intent.getBooleanExtra("gpu", true)
                                 intent.getStringExtra("prompt")?.let { prompt = it }
+                                intent.getStringArrayExtra("stops")?.let { stopSequences = it.toList() }
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 startGeneration()
                             } else {
