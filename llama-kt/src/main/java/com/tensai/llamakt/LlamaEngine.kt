@@ -7,6 +7,26 @@ import org.json.JSONObject
 data class ChatMessage(val role: String, val content: String)
 
 /**
+ * Sampling parameters for a completion.
+ *
+ * [nPredict] — hard cap on the number of generated tokens.
+ * [temperature] — softmax temperature. Lower = more deterministic,
+ *   higher = more random. 0 disables randomness (greedy). Default 0.8.
+ * [topK] — keep only the K most probable tokens before sampling.
+ *   0 disables the filter. Default 40.
+ * [topP] — nucleus sampling: keep the smallest set of tokens whose
+ *   cumulative probability reaches P. 1.0 disables the filter. Default 0.95.
+ *
+ * Defaults match llama.cpp's common_params_sampling.
+ */
+data class SamplingParams(
+    val nPredict: Int = 512,
+    val temperature: Float = 0.8f,
+    val topK: Int = 40,
+    val topP: Float = 0.95f,
+)
+
+/**
  * Information about a single ggml backend device.
  * [name] — device name as reported by ggml (e.g. "Mali-G68 MC4")
  * [description] — backend registry name (e.g. "Vulkan", "CPU")
@@ -112,12 +132,19 @@ class LlamaEngine {
 
     /**
      * Run a completion for [prompt], streaming tokens via [callback].
-     * [nPredict] caps the number of generated tokens (hard stop).
+     * [params] controls generation length and sampling (see [SamplingParams]).
      * This is a blocking call — run it from a background thread or
      * use the [decode] Flow extension which handles that automatically.
      */
-    fun completion(prompt: String, nPredict: Int = 512, callback: TokenCallback) =
-        nativeCompletion(handle, prompt, nPredict, callback)
+    fun completion(
+        prompt: String,
+        params: SamplingParams = SamplingParams(),
+        callback: TokenCallback,
+    ) = nativeCompletion(
+        handle, prompt,
+        params.nPredict, params.temperature, params.topK, params.topP,
+        callback,
+    )
 
     // ------------------------------------------------------------------
     // JNI declarations — names and types must match tensai_jni.cpp exactly
@@ -127,7 +154,11 @@ class LlamaEngine {
     private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int): Long
     private external fun nativeFree(h: Long)
-    private external fun nativeCompletion(h: Long, prompt: String, nPredict: Int, cb: TokenCallback)
+    private external fun nativeCompletion(
+        h: Long, prompt: String,
+        nPredict: Int, temperature: Float, topK: Int, topP: Float,
+        cb: TokenCallback,
+    )
     private external fun nativeFormatChat(h: Long, messagesJson: String): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int

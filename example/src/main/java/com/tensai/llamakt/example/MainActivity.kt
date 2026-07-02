@@ -30,6 +30,7 @@ import androidx.lifecycle.lifecycleScope
 import com.tensai.llamakt.BackendInfo
 import com.tensai.llamakt.ChatMessage
 import com.tensai.llamakt.LlamaEngine
+import com.tensai.llamakt.SamplingParams
 import com.tensai.llamakt.chat
 import kotlinx.coroutines.*
 import java.io.File
@@ -41,6 +42,16 @@ private val PRESET_PROMPTS = listOf(
     "Summarize the theory of general relativity for a beginner.",
     "Write a detailed essay about the history of computing.",
     "List 20 creative startup ideas, each with a one-line description.",
+)
+
+// Short-output prompts designed to make sampling effects visible:
+// run the same prompt several times and compare outputs across runs.
+private val SAMPLING_TEST_PROMPTS = listOf(
+    "Name one random animal. Answer with a single word only.",
+    "Give me a random 4-digit number. Answer with the number only.",
+    "Write the first sentence of a story about a lighthouse.",
+    "List 5 random words, comma-separated.",
+    "Complete this sentence in 10 words or less: The door opened and",
 )
 
 // ---------------------------------------------------------------------------
@@ -248,6 +259,40 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Labeled slider row for a sampling parameter: label — slider — value. */
+    @Composable
+    fun SamplingSlider(
+        label: String,
+        value: Float,
+        range: ClosedFloatingPointRange<Float>,
+        enabled: Boolean,
+        isInt: Boolean = false,
+        onChange: (Float) -> Unit,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.width(72.dp),
+            )
+            Slider(
+                value = value,
+                onValueChange = onChange,
+                valueRange = range,
+                enabled = enabled,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                if (isInt) "${value.toInt()}" else "%.2f".format(value),
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.width(44.dp),
+            )
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun BenchScreen() {
@@ -282,6 +327,13 @@ class MainActivity : ComponentActivity() {
 
         // Graphs collapsed by default
         var showGraphs by remember { mutableStateOf(false) }
+
+        // Sampling controls — defaults match llama.cpp / SamplingParams
+        var showSampling by remember { mutableStateOf(false) }
+        var maxTokens by remember { mutableStateOf(512f) }
+        var temperature by remember { mutableStateOf(0.8f) }
+        var topK by remember { mutableStateOf(40f) }
+        var topP by remember { mutableStateOf(0.95f) }
 
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
@@ -451,6 +503,26 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // ── Sampling-test chips (short outputs, easy to compare) ──
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                    ) {
+                        items(SAMPLING_TEST_PROMPTS) { preset ->
+                            SuggestionChip(
+                                onClick = { prompt = preset },
+                                label = {
+                                    Text(
+                                        text = "🎲 " + preset.take(30) + if (preset.length > 30) "…" else "",
+                                        maxLines = 1,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                },
+                                enabled = !generating,
+                            )
+                        }
+                    }
+
                     // ── Prompt field ──────────────────────────────────────────
                     OutlinedTextField(
                         value = prompt,
@@ -459,6 +531,49 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !generating,
                     )
+
+                    // ── Sampling controls (collapsible) ───────────────────────
+                    TextButton(
+                        onClick = { showSampling = !showSampling },
+                        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            (if (showSampling) "▾ Sampling" else "▸ Sampling") +
+                                "  ·  ${maxTokens.toInt()} tok · T %.2f · K ${topK.toInt()} · P %.2f"
+                                    .format(temperature, topP),
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                    if (showSampling) {
+                        Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+                            SamplingSlider(
+                                label = "Max tok",
+                                value = maxTokens,
+                                range = 16f..2048f,
+                                enabled = !generating,
+                                isInt = true,
+                            ) { maxTokens = it }
+                            SamplingSlider(
+                                label = "Temp",
+                                value = temperature,
+                                range = 0f..2f,
+                                enabled = !generating,
+                            ) { temperature = it }
+                            SamplingSlider(
+                                label = "Top-K",
+                                value = topK,
+                                range = 0f..100f,
+                                enabled = !generating,
+                                isInt = true,
+                            ) { topK = it }
+                            SamplingSlider(
+                                label = "Top-P",
+                                value = topP,
+                                range = 0f..1f,
+                                enabled = !generating,
+                            ) { topP = it }
+                        }
+                    }
 
                     // ── Generate / Stop ───────────────────────────────────────
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -503,7 +618,13 @@ class MainActivity : ComponentActivity() {
                                         var lastSampleMs = 0L
 
                                         val messages = listOf(ChatMessage("user", prompt))
-                                        engine.chat(messages).collect { token ->
+                                        val sampling = SamplingParams(
+                                            nPredict = maxTokens.toInt(),
+                                            temperature = temperature,
+                                            topK = topK.toInt(),
+                                            topP = topP,
+                                        )
+                                        engine.chat(messages, sampling).collect { token ->
                                             output += token
                                             tokenCount++
 

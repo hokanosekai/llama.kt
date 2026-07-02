@@ -190,6 +190,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jlong   h,
         jstring prompt,
         jint    nPredict,
+        jfloat  temperature,
+        jint    topK,
+        jfloat  topP,
         jobject cb)
 {
     if (h == 0L) return;
@@ -212,6 +215,15 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     // Set prompt, n_predict cap, and rewind completion state
     rnctx->params.prompt = jstring_to_std(env, prompt);
     rnctx->params.n_predict = static_cast<int32_t>(nPredict > 0 ? nPredict : 512);
+
+    // Sampling parameters — read by common_sampler_init() inside initSampling().
+    // temp <= 0 → greedy decoding; topK 0 / topP 1.0 disable those filters.
+    rnctx->params.sampling.temp  = static_cast<float>(temperature);
+    rnctx->params.sampling.top_k = static_cast<int32_t>(topK);
+    rnctx->params.sampling.top_p = static_cast<float>(topP);
+    LOGI("nativeCompletion: n_predict=%d temp=%.2f top_k=%d top_p=%.2f",
+         rnctx->params.n_predict, rnctx->params.sampling.temp,
+         rnctx->params.sampling.top_k, rnctx->params.sampling.top_p);
 
     auto* comp = rnctx->completion;
     comp->rewind();
