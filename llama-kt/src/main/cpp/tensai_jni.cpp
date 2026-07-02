@@ -31,6 +31,38 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
+// Log redirection — llama.cpp/ggml log to stderr by default, which is lost on
+// Android. Forward everything (including GGML_ABORT/assert messages) to
+// logcat so native crashes are diagnosable from `adb logcat`.
+// ---------------------------------------------------------------------------
+
+static void tensai_log_callback(lm_ggml_log_level level, const char* text, void* /* user_data */) {
+    int prio;
+    switch (level) {
+        case LM_GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
+        case LM_GGML_LOG_LEVEL_WARN:  prio = ANDROID_LOG_WARN;  break;
+        case LM_GGML_LOG_LEVEL_DEBUG: prio = ANDROID_LOG_DEBUG; break;
+        default:                      prio = ANDROID_LOG_INFO;  break;
+    }
+    __android_log_print(prio, "llama.cpp", "%s", text);
+}
+
+// GGML_ABORT/GGML_ASSERT bypass the log callback and print to stderr before
+// calling abort() — hook the abort callback so the assert message (file:line)
+// reaches logcat before the process dies.
+static void tensai_abort_callback(const char* message) {
+    __android_log_print(ANDROID_LOG_FATAL, "llama.cpp", "GGML ABORT: %s", message);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+JNI_OnLoad(JavaVM* /* vm */, void* /* reserved */) {
+    llama_log_set(tensai_log_callback, nullptr);
+    lm_ggml_log_set(tensai_log_callback, nullptr);
+    lm_ggml_set_abort_callback(tensai_abort_callback);
+    return JNI_VERSION_1_6;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -139,7 +171,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jobject /* thiz */,
         jstring path,
         jint nGpuLayers,
-        jint nCtx)
+        jint nCtx,
+        jint nThreads)
 {
     auto* rnctx = new rnllama::llama_rn_context();
 
@@ -149,8 +182,17 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
     p.n_ctx        = static_cast<int32_t>(nCtx > 0 ? nCtx : 4096);
     if (p.n_batch <= 0) p.n_batch = 512;
 
-    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d",
-         p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch);
+    // nThreads <= 0 → keep llama.cpp auto-detect. Explicit value pins both
+    // the generation and batch (prefill) thread pools — on big.LITTLE SoCs
+    // fewer threads on big cores can beat auto across all cores.
+    if (nThreads > 0) {
+        p.cpuparams.n_threads       = static_cast<int32_t>(nThreads);
+        p.cpuparams_batch.n_threads = static_cast<int32_t>(nThreads);
+    }
+
+    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d",
+         p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch,
+         nThreads > 0 ? nThreads : -1);
 
     if (!rnctx->loadModel(p)) {
         LOGE("loadModel failed");

@@ -321,6 +321,9 @@ class MainActivity : ComponentActivity() {
         val nGpuLayers by derivedStateOf { if (useGpu) 99 else 0 }
         val nCtx = 4096
 
+        // CPU threads: 0 = llama.cpp auto. Load-time param — changing forces reload.
+        var nThreads by remember { mutableStateOf(0) }
+
         // Live metric snapshots for stats strip
         var currentRamMb by remember { mutableStateOf<Float?>(null) }
         var currentCpuPct by remember { mutableStateOf<Float?>(null) }
@@ -483,6 +486,28 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // ── CPU threads selector (load-time — reload on change) ───
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("Threads", style = MaterialTheme.typography.labelSmall)
+                        listOf(0, 2, 4, 6, 8).forEach { t ->
+                            FilterChip(
+                                selected = nThreads == t,
+                                onClick = {
+                                    if (!generating) {
+                                        nThreads = t
+                                        modelLoaded = false
+                                        activeBackendStr = ""
+                                    }
+                                },
+                                label = { Text(if (t == 0) "auto" else "$t") },
+                                enabled = !generating && !copying,
+                            )
+                        }
+                    }
+
                     // ── Preset chips ──────────────────────────────────────────
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -598,9 +623,9 @@ class MainActivity : ComponentActivity() {
                                 generationJob = lifecycleScope.launch {
                                     try {
                                         if (!modelLoaded) {
-                                            status = "Loading model (nGpuLayers=$nGpuLayers)…"
+                                            status = "Loading model (nGpuLayers=$nGpuLayers, threads=${if (nThreads == 0) "auto" else nThreads})…"
                                             withContext(Dispatchers.IO) {
-                                                engine.load(path, nGpuLayers, nCtx)
+                                                engine.load(path, nGpuLayers, nCtx, nThreads)
                                             }
                                             modelLoaded = true
                                             activeBackendStr = withContext(Dispatchers.IO) {

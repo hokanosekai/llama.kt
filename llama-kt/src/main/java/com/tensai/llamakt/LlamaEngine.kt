@@ -75,10 +75,13 @@ class LlamaEngine {
      * Load a GGUF model from [path].
      * [nGpuLayers] = 0 → CPU only; > 0 → offload layers to GPU (Vulkan on Mali).
      * [nCtx] = context window size (tokens). Defaults to 4096.
+     * [nThreads] = CPU inference threads. 0 → llama.cpp auto-detect. On
+     *   big.LITTLE SoCs, matching the number of big cores (e.g. 2 on a
+     *   2×A78 + 6×A55 chip) can beat auto — slow cores drag the pool down.
      * Throws [IllegalStateException] if the native load fails.
      */
-    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096) {
-        handle = nativeLoadModel(path, nGpuLayers, nCtx)
+    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0) {
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, nThreads)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -152,7 +155,7 @@ class LlamaEngine {
 
     private external fun nativeListBackends(): String
     private external fun nativeActiveBackend(h: Long): String
-    private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int): Long
+    private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
         h: Long, prompt: String,
