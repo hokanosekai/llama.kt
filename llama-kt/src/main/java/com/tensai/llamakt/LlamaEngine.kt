@@ -124,7 +124,9 @@ class LlamaEngine {
      *   loading thread; return false to abort the load.
      * [kvCacheType] — KV cache quantization: null → f16 (default), "q8_0" →
      *   half the cache memory (double the context in the same RAM), "q4_0" →
-     *   quarter (quality risk). Applied to both K and V.
+     *   quarter (quality risk). Applied to both K and V. Quantized V cache
+     *   requires flash attention — do not combine with flashAttn = "off"
+     *   (the load will fail).
      * [flashAttn] — flash attention: null → auto (llama.cpp decides), "on",
      *   "off". On GPUs without matrix cores (Mali) the generic FA path can
      *   cost instead of help — worth benchmarking per device.

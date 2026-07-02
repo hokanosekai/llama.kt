@@ -21,6 +21,27 @@ Multimodal (vision via `mtmd`) is vendored but not yet wired through the Kotlin 
 
 **CPU threads.** `load()` defaults to pinning inference threads to the big cores (detected via `cpuinfo_max_freq`). On big.LITTLE SoCs this measured up to 6× faster than llama.cpp's auto-detect, which lets efficiency cores drag the pool down.
 
+## Measured performance
+
+OPPO CPH2251 — MediaTek Dimensity 900 (2×A78@2.4GHz + 6×A55@2.0GHz, Mali-G68 MC4, LPDDR4X), Android 13. nCtx 4096, temp 0, ~20-token prompt, CPU = 2 big-core threads (lib default), llama.cpp b9769 + the UMA fix. pp = prompt processing, tg = generation, both tok/s.
+
+| Model | Quant | Backend | pp | tg |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | Q4_K_M | **CPU** | 29.5 | **15.0** |
+| | | Vulkan | 7.0 | 9.0 |
+| Llama-3.2-3B-Instruct | Q4_K_M | **CPU** | 6.0 | **3.9** |
+| | | Vulkan | 1.2 | 2.9 |
+| Gemma-3n-E2B-it | Q4_K_M | CPU | 1.9 | 1.1 |
+| | Q4_K_M | Vulkan | 1.8 | 1.9 |
+| | Q4_0 | **Vulkan + KV q8_0** | 1.8 | **2.1** |
+
+What the numbers say for this device class (UMA, no GPU matrix cores):
+
+- **Dense models run fastest on the big CPU cores.** The Vulkan backend loses on both prefill and decode — Mali has no cooperative-matrix path, so the GPU is bandwidth-bound through generic shaders.
+- **Gemma 3n is the exception**: its llama.cpp CPU path is disproportionately slow (per-layer embeddings), so full GPU offload is ~2× CPU. Prefill stays ~1.8 tok/s on every backend — a structural upstream limitation of the gemma3n graph, not a tuning problem.
+- **Partial GPU offload always loses** on UMA: every tested split (8/16/24 of 30 layers) was slower than either full CPU or full GPU, because graph-split synchronization costs more than the shared-memory GPU brings.
+- **KV cache q8_0** helps decode on the bandwidth-bound GPU for Gemma (+7%), costs ~13% on CPU, and is neutral-to-negative elsewhere. It requires flash attention (quantized V cache), so never combine it with `flashAttn = "off"`.
+
 ## Requirements
 
 - Android NDK r27+, `arm64-v8a` (only ABI targeted)
