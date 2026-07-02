@@ -323,7 +323,10 @@ class MainActivity : ComponentActivity() {
         // -1 = derive from useGpu; >= 0 = explicit layer count (autorun extra "ngl")
         var nglOverride by remember { mutableStateOf(-1) }
         val nGpuLayers by derivedStateOf { if (nglOverride >= 0) nglOverride else if (useGpu) 99 else 0 }
-        val nCtx = 4096
+
+        // Context window. KV cache grows linearly with it (f16, Llama-3B class:
+        // ~450MB at 4096). Load-time param — changing forces reload.
+        var nCtx by remember { mutableStateOf(4096) }
 
         // CPU threads: 0 = llama.cpp auto. Load-time param — changing forces reload.
         var nThreads by remember { mutableStateOf(0) }
@@ -536,6 +539,28 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 label = { Text(if (t == 0) "auto" else "$t") },
+                                enabled = !generating && !copying,
+                            )
+                        }
+                    }
+
+                    // ── Context size selector (load-time — reload on change) ──
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("Context", style = MaterialTheme.typography.labelSmall)
+                        listOf(2048, 4096, 8192, 16384).forEach { c ->
+                            FilterChip(
+                                selected = nCtx == c,
+                                onClick = {
+                                    if (!generating) {
+                                        nCtx = c
+                                        modelLoaded = false
+                                        activeBackendStr = ""
+                                    }
+                                },
+                                label = { Text(if (c >= 1024) "${c / 1024}k" else "$c") },
                                 enabled = !generating && !copying,
                             )
                         }
