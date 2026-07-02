@@ -193,7 +193,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jint nGpuLayers,
         jint nCtx,
         jint nThreads,
-        jobject progressCb)
+        jobject progressCb,
+        jstring kvCacheType)
 {
     auto* rnctx = new rnllama::llama_rn_context();
 
@@ -211,9 +212,18 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         p.cpuparams_batch.n_threads = static_cast<int32_t>(nThreads);
     }
 
-    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d",
+    // KV cache quantization — empty/invalid falls back to f16 inside
+    // kv_cache_type_from_str. Applied to both K and V.
+    const std::string kv_type = jstring_to_std(env, kvCacheType);
+    if (!kv_type.empty()) {
+        p.cache_type_k = rnllama::kv_cache_type_from_str(kv_type);
+        p.cache_type_v = rnllama::kv_cache_type_from_str(kv_type);
+    }
+
+    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d kv_cache=%s",
          p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch,
-         nThreads > 0 ? nThreads : -1, progressCb != nullptr);
+         nThreads > 0 ? nThreads : -1, progressCb != nullptr,
+         kv_type.empty() ? "f16(default)" : kv_type.c_str());
 
     LoadProgressHolder holder{};
     jclass cbClass = nullptr;

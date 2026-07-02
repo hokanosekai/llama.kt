@@ -101,6 +101,9 @@ class LlamaEngine {
      *   > 0 → explicit thread count.
      * [onProgress] — optional loading progress (0.0–1.0), called from the
      *   loading thread; return false to abort the load.
+     * [kvCacheType] — KV cache quantization: null → f16 (default), "q8_0" →
+     *   half the cache memory (double the context in the same RAM), "q4_0" →
+     *   quarter (quality risk). Applied to both K and V.
      * Throws [IllegalStateException] if the native load fails or is aborted.
      */
     fun load(
@@ -109,13 +112,14 @@ class LlamaEngine {
         nCtx: Int = 4096,
         nThreads: Int = 0,
         onProgress: LoadProgressCallback? = null,
+        kvCacheType: String? = null,
     ) {
         val resolved = when {
             nThreads > 0 -> nThreads
             nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
             else -> 0                              // -1 → llama auto
         }
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress)
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -192,7 +196,7 @@ class LlamaEngine {
     private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(
         path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int,
-        progressCb: LoadProgressCallback?,
+        progressCb: LoadProgressCallback?, kvCacheType: String?,
     ): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(

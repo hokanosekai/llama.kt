@@ -325,6 +325,9 @@ class MainActivity : ComponentActivity() {
         // CPU threads: 0 = llama.cpp auto. Load-time param — changing forces reload.
         var nThreads by remember { mutableStateOf(0) }
 
+        // KV cache type: null = f16. Settable via autorun extra "kv" (e.g. "q8_0").
+        var kvCacheType by remember { mutableStateOf<String?>(null) }
+
         // Live metric snapshots for stats strip
         var currentRamMb by remember { mutableStateOf<Float?>(null) }
         var currentCpuPct by remember { mutableStateOf<Float?>(null) }
@@ -656,7 +659,8 @@ class MainActivity : ComponentActivity() {
                                                     LoadProgressCallback { p ->
                                                         status = "Loading model… ${(p * 100).toInt()}%"
                                                         true
-                                                    })
+                                                    },
+                                                    kvCacheType)
                                             }
                                             modelLoaded = true
                                             activeBackendStr = withContext(Dispatchers.IO) {
@@ -746,6 +750,7 @@ class MainActivity : ComponentActivity() {
                                         android.util.Log.i(
                                             "LlamaKtBench",
                                             "bench: threads=${if (nThreads == 0) "auto" else nThreads} backend=$activeBackendStr " +
+                                                "kv=${kvCacheType ?: "f16"} " +
                                                 "tokens=$tokenCount ttft=${ttftMs}ms elapsed=%.1fs tok/s=%.2f model=$modelDisplayName".format(elapsedSec, tokPerSec),
                                         )
 
@@ -784,6 +789,8 @@ class MainActivity : ComponentActivity() {
                                 intent.getStringArrayExtra("stops")?.let { stopSequences = it.toList() }
                                 autorunSaveSession = intent.getBooleanExtra("save", false)
                                 autorunLoadSession = intent.getBooleanExtra("load", false)
+                                kvCacheType = intent.getStringExtra("kv")
+                                if (intent.hasExtra("temp")) temperature = intent.getFloatExtra("temp", 0.8f)
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 startGeneration()
                             } else {
@@ -843,7 +850,8 @@ class MainActivity : ComponentActivity() {
                                                         LoadProgressCallback { p ->
                                                             status = "Loading model… ${(p * 100).toInt()}%"
                                                             true
-                                                        })
+                                                        },
+                                                        kvCacheType)
                                                 }
                                                 modelLoaded = true
                                                 activeBackendStr = withContext(Dispatchers.IO) { engine.activeBackend() }
