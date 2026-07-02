@@ -340,6 +340,10 @@ class MainActivity : ComponentActivity() {
         // Settable via the autorun intent extra "stops" (no UI control)
         var stopSequences by remember { mutableStateOf<List<String>>(emptyList()) }
 
+        // Session persistence test hooks (autorun extras "save"/"load")
+        var autorunSaveSession by remember { mutableStateOf(false) }
+        var autorunLoadSession by remember { mutableStateOf(false) }
+
         LaunchedEffect(Unit) {
             val backends = withContext(Dispatchers.IO) {
                 try { engine.availableBackends() } catch (e: Exception) { emptyList() }
@@ -635,7 +639,15 @@ class MainActivity : ComponentActivity() {
                                             status = "Model loaded [$activeBackendStr]. Generating…"
                                         }
 
+                                        if (autorunLoadSession) {
+                                            val n = withContext(Dispatchers.IO) {
+                                                engine.loadSession(File(cacheDir, "session.bin").absolutePath)
+                                            }
+                                            android.util.Log.i("LlamaKtBench", "session loaded: $n tokens, kvUsed=${engine.kvUsed()}")
+                                        }
+
                                         var tokenCount = 0
+                                        var firstTokenMs = 0L
                                         val startMs = System.currentTimeMillis()
 
                                         val windowSize = 16
@@ -654,6 +666,7 @@ class MainActivity : ComponentActivity() {
                                         engine.chat(messages, sampling).collect { token ->
                                             output += token
                                             tokenCount++
+                                            if (firstTokenMs == 0L) firstTokenMs = System.currentTimeMillis()
 
                                             val nowMs = System.currentTimeMillis()
 
@@ -702,11 +715,19 @@ class MainActivity : ComponentActivity() {
                                         kvUsed = engine.kvUsed()
                                         status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s) [$activeBackendStr]"
                                             .format(elapsedSec, tokPerSec)
+                                        val ttftMs = if (firstTokenMs > 0L) firstTokenMs - startMs else -1L
                                         android.util.Log.i(
                                             "LlamaKtBench",
                                             "bench: threads=${if (nThreads == 0) "auto" else nThreads} backend=$activeBackendStr " +
-                                                "tokens=$tokenCount elapsed=%.1fs tok/s=%.2f model=$modelDisplayName".format(elapsedSec, tokPerSec),
+                                                "tokens=$tokenCount ttft=${ttftMs}ms elapsed=%.1fs tok/s=%.2f model=$modelDisplayName".format(elapsedSec, tokPerSec),
                                         )
+
+                                        if (autorunSaveSession) {
+                                            val n = withContext(Dispatchers.IO) {
+                                                engine.saveSession(File(cacheDir, "session.bin").absolutePath)
+                                            }
+                                            android.util.Log.i("LlamaKtBench", "session saved: $n tokens, kvUsed=${engine.kvUsed()}")
+                                        }
 
                                     } catch (e: CancellationException) {
                                         status = "Interrupted."
@@ -734,6 +755,8 @@ class MainActivity : ComponentActivity() {
                                 useGpu = intent.getBooleanExtra("gpu", true)
                                 intent.getStringExtra("prompt")?.let { prompt = it }
                                 intent.getStringArrayExtra("stops")?.let { stopSequences = it.toList() }
+                                autorunSaveSession = intent.getBooleanExtra("save", false)
+                                autorunLoadSession = intent.getBooleanExtra("load", false)
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 startGeneration()
                             } else {
