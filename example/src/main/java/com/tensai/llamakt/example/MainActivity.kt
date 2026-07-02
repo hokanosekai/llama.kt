@@ -2,6 +2,7 @@ package com.tensai.llamakt.example
 
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -252,6 +253,7 @@ class MainActivity : ComponentActivity() {
     fun BenchScreen() {
         // State
         var localPath by remember { mutableStateOf<String?>(null) }
+        var modelDisplayName by remember { mutableStateOf<String?>(null) }
         var modelLoaded by remember { mutableStateOf(false) }
         var prompt by remember { mutableStateOf("Hello, who are you?") }
         var output by remember { mutableStateOf("") }
@@ -294,9 +296,16 @@ class MainActivity : ComponentActivity() {
         ) { uri: Uri? ->
             if (uri == null) return@rememberLauncherForActivityResult
 
+            // Resolve display name from SAF before kicking off the copy
+            val displayName: String = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val col = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (col >= 0 && cursor.moveToFirst()) cursor.getString(col) else null
+            } ?: uri.lastPathSegment ?: "model.gguf"
+
             copying = true
             status = "Copying GGUF to cache… (may take a while for large files)"
             modelLoaded = false
+            modelDisplayName = displayName
             activeBackendStr = ""
 
             lifecycleScope.launch(Dispatchers.IO) {
@@ -307,7 +316,7 @@ class MainActivity : ComponentActivity() {
                     }
                     localPath = dest.absolutePath
                     withContext(Dispatchers.Main) {
-                        status = "Copied → ${dest.name} (${dest.length() / 1_048_576} MB). Ready."
+                        status = "Copied → $displayName (${dest.length() / 1_048_576} MB). Ready."
                         copying = false
                     }
                 } catch (e: Exception) {
@@ -374,9 +383,9 @@ class MainActivity : ComponentActivity() {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp))
                         }
 
-                        localPath?.let { path ->
+                        modelDisplayName?.let { name ->
                             Text(
-                                File(path).name,
+                                name,
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,
                                 modifier = Modifier.weight(1f),
