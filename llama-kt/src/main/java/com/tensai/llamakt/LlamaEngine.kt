@@ -54,6 +54,27 @@ fun interface LoadProgressCallback {
     fun onProgress(progress: Float): Boolean
 }
 
+/**
+ * GGUF header metadata, read without loading the weights (milliseconds even
+ * for multi-GB files). See [LlamaEngine.readMetadata].
+ *
+ * [paramCount] is computed from the tensor infos (sum of elements), so it is
+ * the real total — including e.g. per-layer embeddings on Gemma 3n.
+ * [quantLabel] is a human-readable name for [fileType] ("Q4_K_M", …).
+ */
+data class GgufMetadata(
+    val architecture: String,
+    val name: String,
+    val fileType: Int,
+    val quantLabel: String,
+    val contextLength: Long,
+    val embeddingLength: Long,
+    val blockCount: Long,
+    val paramCount: Long,
+    val vocabSize: Long,
+    val fileSizeBytes: Long,
+)
+
 class LlamaEngine {
 
     private var handle: Long = 0L
@@ -216,6 +237,43 @@ class LlamaEngine {
         init {
             System.loadLibrary("llamakt")
         }
+
+        // llama_ftype enum values → human labels (common subset)
+        private val FTYPE_LABELS = mapOf(
+            0 to "F32", 1 to "F16", 2 to "Q4_0", 3 to "Q4_1", 7 to "Q8_0",
+            8 to "Q5_0", 9 to "Q5_1", 10 to "Q2_K", 11 to "Q3_K_S",
+            12 to "Q3_K_M", 13 to "Q3_K_L", 14 to "Q4_K_S", 15 to "Q4_K_M",
+            16 to "Q5_K_S", 17 to "Q5_K_M", 18 to "Q6_K", 24 to "IQ4_NL",
+            25 to "IQ3_S", 26 to "IQ3_M", 30 to "BF16",
+        )
+
+        /**
+         * Read the GGUF header of [path] without loading the model.
+         * Fast (header only) — safe to call on the UI flow for an import
+         * screen. Returns null if the file is not a readable GGUF.
+         */
+        fun readMetadata(path: String): GgufMetadata? {
+            val raw = nativeReadGgufMetadata(path) ?: return null
+            return try {
+                val obj = JSONObject(raw)
+                val ftype = obj.optInt("file_type", -1)
+                GgufMetadata(
+                    architecture    = obj.optString("architecture", "unknown"),
+                    name            = obj.optString("name", ""),
+                    fileType        = ftype,
+                    quantLabel      = FTYPE_LABELS[ftype] ?: "ftype_$ftype",
+                    contextLength   = obj.optLong("context_length", 0),
+                    embeddingLength = obj.optLong("embedding_length", 0),
+                    blockCount      = obj.optLong("block_count", 0),
+                    paramCount      = obj.optLong("param_count", 0),
+                    vocabSize       = obj.optLong("vocab_size", 0),
+                    fileSizeBytes   = obj.optLong("file_size_bytes", 0),
+                )
+            } catch (_: Exception) { null }
+        }
+
+        @JvmStatic
+        private external fun nativeReadGgufMetadata(path: String): String?
 
         /**
          * Count the "big" cores of a big.LITTLE SoC: cores whose

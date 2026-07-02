@@ -382,8 +382,17 @@ class MainActivity : ComponentActivity() {
                         dest.outputStream().use { output -> input.copyTo(output) }
                     }
                     localPath = dest.absolutePath
+                    val meta = LlamaEngine.readMetadata(dest.absolutePath)
                     withContext(Dispatchers.Main) {
-                        status = "Copied → $displayName (${dest.length() / 1_048_576} MB). Ready."
+                        status = if (meta != null) {
+                            "%s · %s · %.1fB params · ctx %d · %d MB. Ready.".format(
+                                meta.architecture, meta.quantLabel,
+                                meta.paramCount / 1e9, meta.contextLength,
+                                meta.fileSizeBytes / 1_048_576,
+                            )
+                        } else {
+                            "Copied → $displayName (${dest.length() / 1_048_576} MB). Ready (not a readable GGUF?)."
+                        }
                         copying = false
                     }
                 } catch (e: Exception) {
@@ -792,6 +801,9 @@ class MainActivity : ComponentActivity() {
                                 kvCacheType = intent.getStringExtra("kv")
                                 if (intent.hasExtra("temp")) temperature = intent.getFloatExtra("temp", 0.8f)
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
+                                LlamaEngine.readMetadata(cached.absolutePath)?.let { m ->
+                                    android.util.Log.i("LlamaKtBench", "metadata: arch=${m.architecture} name=${m.name} quant=${m.quantLabel} params=${m.paramCount} ctx=${m.contextLength} embd=${m.embeddingLength} layers=${m.blockCount} vocab=${m.vocabSize} size=${m.fileSizeBytes}")
+                                }
                                 startGeneration()
                             } else {
                                 status = "autorun: no cached model.gguf"

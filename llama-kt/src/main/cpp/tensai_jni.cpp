@@ -25,6 +25,9 @@
 #include "common/common.h"
 #include "llama.h"
 #include "ggml-backend.h"
+#include "gguf.h"
+
+#include <sys/stat.h>
 
 #define LOG_TAG "TensaiJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -159,6 +162,89 @@ Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
     // GPU requested but no GPU device found — fell back to CPU
     LOGI("nativeActiveBackend: GPU requested but no GPU device in registry, likely CPU fallback");
     return env->NewStringUTF("CPU (GPU requested but unavailable)");
+}
+
+// ---------------------------------------------------------------------------
+// nativeReadGgufMetadata  (static — reads the GGUF header only, no weights)
+// ---------------------------------------------------------------------------
+// Returns a JSON string with architecture, name, file_type, context_length,
+// embedding_length, block_count, param_count, vocab_size, file_size_bytes.
+// no_alloc=true → only the key-value header and tensor infos are read; a
+// multi-GB model is inspected in milliseconds. Returns nullptr on failure.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
+        JNIEnv* env,
+        jclass /* clazz */,
+        jstring path)
+{
+    const std::string fpath = jstring_to_std(env, path);
+
+    lm_gguf_init_params ip{};
+    ip.no_alloc = true;
+    ip.ctx = nullptr;
+
+    lm_gguf_context* gctx = lm_gguf_init_from_file(fpath.c_str(), ip);
+    if (gctx == nullptr) {
+        LOGE("nativeReadGgufMetadata: failed to open %s", fpath.c_str());
+        return nullptr;
+    }
+
+    auto get_str = [&](const std::string& key) -> std::string {
+        int64_t i = lm_gguf_find_key(gctx, key.c_str());
+        return (i >= 0 && lm_gguf_get_kv_type(gctx, i) == LM_GGUF_TYPE_STRING)
+             ? lm_gguf_get_val_str(gctx, i) : "";
+    };
+    // Integer keys vary between u32/u64 across models — handle both.
+    auto get_uint = [&](const std::string& key) -> uint64_t {
+        int64_t i = lm_gguf_find_key(gctx, key.c_str());
+        if (i < 0) return 0;
+        switch (lm_gguf_get_kv_type(gctx, i)) {
+            case LM_GGUF_TYPE_UINT32: return lm_gguf_get_val_u32(gctx, i);
+            case LM_GGUF_TYPE_UINT64: return lm_gguf_get_val_u64(gctx, i);
+            default: return 0;
+        }
+    };
+
+    const std::string arch = get_str("general.architecture");
+
+    // Parameter count: sum of elements over all tensor infos
+    uint64_t n_params = 0;
+    const int64_t n_tensors = lm_gguf_get_n_tensors(gctx);
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const enum lm_ggml_type t = lm_gguf_get_tensor_type(gctx, i);
+        const size_t sz = lm_gguf_get_tensor_size(gctx, i);
+        n_params += sz / lm_ggml_type_size(t) * lm_ggml_blck_size(t);
+    }
+
+    // Vocab size = length of the tokenizer tokens array
+    uint64_t vocab = 0;
+    {
+        int64_t i = lm_gguf_find_key(gctx, "tokenizer.ggml.tokens");
+        if (i >= 0) vocab = lm_gguf_get_arr_n(gctx, i);
+    }
+
+    struct stat st{};
+    const uint64_t file_size = (stat(fpath.c_str(), &st) == 0)
+        ? static_cast<uint64_t>(st.st_size) : 0;
+
+    nlohmann::json j = {
+        {"architecture",     arch},
+        {"name",             get_str("general.name")},
+        {"file_type",        get_uint("general.file_type")},
+        {"context_length",   get_uint(arch + ".context_length")},
+        {"embedding_length", get_uint(arch + ".embedding_length")},
+        {"block_count",      get_uint(arch + ".block_count")},
+        {"param_count",      n_params},
+        {"vocab_size",       vocab},
+        {"file_size_bytes",  file_size},
+    };
+
+    lm_gguf_free(gctx);
+
+    const std::string out = j.dump();
+    LOGI("nativeReadGgufMetadata: %s", out.c_str());
+    return env->NewStringUTF(out.c_str());
 }
 
 // ---------------------------------------------------------------------------

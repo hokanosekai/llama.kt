@@ -69,7 +69,10 @@ engine.free()
 ```kotlin
 class LlamaEngine {
     // nThreads: 0 = pin to big cores (default), -1 = llama.cpp auto, >0 = explicit
-    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0)
+    // onProgress: loading progress 0.0-1.0, return false to abort the load
+    // kvCacheType: null = f16, "q8_0" halves KV memory (~13% decode cost measured)
+    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0,
+             onProgress: LoadProgressCallback? = null, kvCacheType: String? = null)
     fun completion(prompt: String, params: SamplingParams = SamplingParams(), callback: TokenCallback)
     fun formatChat(messages: List<ChatMessage>): String
     fun tokenize(text: String): IntArray
@@ -83,8 +86,21 @@ class LlamaEngine {
 
     companion object {
         fun detectBigCoreCount(): Int  // cores with cpuinfo_max_freq >= 85% of the fastest
+        fun readMetadata(path: String): GgufMetadata?  // header only — milliseconds, no load
     }
 }
+
+// GGUF header inspection without loading the weights: architecture, quant,
+// real parameter count (summed from tensor infos), trained context length,
+// vocab size, file size. Feed this to an import screen / compatibility check.
+data class GgufMetadata(
+    val architecture: String, val name: String,
+    val fileType: Int, val quantLabel: String,
+    val contextLength: Long, val embeddingLength: Long, val blockCount: Long,
+    val paramCount: Long, val vocabSize: Long, val fileSizeBytes: Long,
+)
+
+fun interface LoadProgressCallback { fun onProgress(progress: Float): Boolean }
 
 data class SamplingParams(
     val nPredict: Int = 512,       // hard cap on generated tokens
