@@ -536,6 +536,28 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // ── KV cache type selector (load-time — reload on change) ─
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("KV cache", style = MaterialTheme.typography.labelSmall)
+                        listOf(null, "q8_0").forEach { t ->
+                            FilterChip(
+                                selected = kvCacheType == t,
+                                onClick = {
+                                    if (!generating) {
+                                        kvCacheType = t
+                                        modelLoaded = false
+                                        activeBackendStr = ""
+                                    }
+                                },
+                                label = { Text(t ?: "f16") },
+                                enabled = !generating && !copying,
+                            )
+                        }
+                    }
+
                     // ── Preset chips ──────────────────────────────────────────
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
