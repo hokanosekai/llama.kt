@@ -337,7 +337,9 @@ class MainActivity : ComponentActivity() {
         var temperature by remember { mutableStateOf(0.8f) }
         var topK by remember { mutableStateOf(40f) }
         var topP by remember { mutableStateOf(0.95f) }
-        // Settable via the autorun intent extra "stops" (no UI control)
+        var minP by remember { mutableStateOf(0.05f) }
+        // Comma-separated in the UI field; also settable via autorun extra "stops"
+        var stopsField by remember { mutableStateOf("") }
         var stopSequences by remember { mutableStateOf<List<String>>(emptyList()) }
 
         // Session persistence test hooks (autorun extras "save"/"load")
@@ -603,6 +605,25 @@ class MainActivity : ComponentActivity() {
                                 range = 0f..1f,
                                 enabled = !generating,
                             ) { topP = it }
+                            SamplingSlider(
+                                label = "Min-P",
+                                value = minP,
+                                range = 0f..0.5f,
+                                enabled = !generating,
+                            ) { minP = it }
+                            OutlinedTextField(
+                                value = stopsField,
+                                onValueChange = {
+                                    stopsField = it
+                                    stopSequences = it.split(',')
+                                        .map(String::trim)
+                                        .filter(String::isNotEmpty)
+                                },
+                                label = { Text("Stop sequences (comma-separated)") },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = !generating,
+                                textStyle = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
 
@@ -661,6 +682,7 @@ class MainActivity : ComponentActivity() {
                                             temperature = temperature,
                                             topK = topK.toInt(),
                                             topP = topP,
+                                            minP = minP,
                                             stopSequences = stopSequences,
                                         )
                                         engine.chat(messages, sampling).collect { token ->
@@ -781,6 +803,56 @@ class MainActivity : ComponentActivity() {
                             },
                             enabled = generating,
                         ) { Text("Stop") }
+                    }
+
+                    // ── Session save / load (cacheDir/session.bin) ────────────
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                lifecycleScope.launch {
+                                    try {
+                                        val n = withContext(Dispatchers.IO) {
+                                            engine.saveSession(File(cacheDir, "session.bin").absolutePath)
+                                        }
+                                        status = if (n >= 0) "Session saved ($n tokens)." else "Session save failed."
+                                    } catch (e: Exception) {
+                                        status = "Session save failed: ${e.message}"
+                                    }
+                                }
+                            },
+                            enabled = modelLoaded && !generating,
+                        ) { Text("Save session") }
+
+                        OutlinedButton(
+                            onClick = {
+                                val path = localPath
+                                if (path == null) {
+                                    status = "Pick a GGUF first."
+                                } else {
+                                    lifecycleScope.launch {
+                                        try {
+                                            if (!modelLoaded) {
+                                                status = "Loading model…"
+                                                withContext(Dispatchers.IO) {
+                                                    engine.load(path, nGpuLayers, nCtx, nThreads)
+                                                }
+                                                modelLoaded = true
+                                                activeBackendStr = withContext(Dispatchers.IO) { engine.activeBackend() }
+                                            }
+                                            val n = withContext(Dispatchers.IO) {
+                                                engine.loadSession(File(cacheDir, "session.bin").absolutePath)
+                                            }
+                                            kvUsed = engine.kvUsed()
+                                            status = if (n >= 0) "Session loaded ($n tokens, KV $kvUsed)."
+                                                     else "Session load failed (no saved session?)."
+                                        } catch (e: Exception) {
+                                            status = "Session load failed: ${e.message}"
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !generating && !copying && localPath != null,
+                        ) { Text("Load session") }
                     }
 
                     // ── Stats strip ───────────────────────────────────────────
