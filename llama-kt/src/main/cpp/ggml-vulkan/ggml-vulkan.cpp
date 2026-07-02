@@ -129,7 +129,10 @@ typedef struct VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE {
 #endif
 
 #define ROUNDUP_POW2(M, N) (((M) + (N) - 1) & ~((N) - 1))
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+// Overflow-safe: (M + N - 1) wraps in 32-bit when N is huge (e.g. mobile
+// Vulkan drivers report maxComputeWorkGroupCount = UINT32_MAX), silently
+// yielding 0. Division-based form has no intermediate that can overflow.
+#define CEIL_DIV(M, N) (((M) / (N)) + (((M) % (N)) != 0))
 static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_VENDOR_ID_AMD 0x1002
@@ -8058,11 +8061,7 @@ static void lm_ggml_vk_matmul(
         uint32_t padded_n) {
         VK_LOG_DEBUG("lm_ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
-        // Promote to 64-bit: some mobile drivers (Mali, Adreno) report
-        // maxComputeWorkGroupCount = UINT32_MAX, which makes the 32-bit
-        // CEIL_DIV numerator (batch + N - 1) wrap and yield 0 for batch >= 2,
-        // under-requesting descriptor sets (upstream #23057).
-        lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(uint64_t{batch}, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
+        lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
 
         uint32_t base_work_group_z = 0;
         while (base_work_group_z < batch) {
@@ -8085,8 +8084,7 @@ static void lm_ggml_vk_matmul(
     uint32_t k_split = CEIL_DIV(k, split_k);
     k_split = ROUNDUP_POW2(k_split, 256);
 
-    // 64-bit promotion: see the comment on the split_k == 1 branch above.
-    lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(uint64_t{batch}, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
+    lm_ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
 
     uint32_t base_work_group_z = 0;
     while (base_work_group_z < batch) {
