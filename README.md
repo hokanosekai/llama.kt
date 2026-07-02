@@ -29,6 +29,8 @@ OPPO CPH2251 — MediaTek Dimensity 900 (2×A78@2.4GHz + 6×A55@2.0GHz, Mali-G68
 |---|---|---|---|---|
 | Qwen2.5-0.5B-Instruct | Q4_K_M | **CPU** | 29.5 | **15.0** |
 | | | Vulkan | 7.0 | 9.0 |
+| Gemma-3-1B-it | Q4_K_M | **CPU** | 10.9 | **6.0** |
+| | | Vulkan | 3.7 | 5.4 |
 | Llama-3.2-3B-Instruct | Q4_K_M | **CPU** | 6.0 | **3.9** |
 | | | Vulkan | 1.2 | 2.9 |
 | Gemma-3n-E2B-it | Q4_K_M | CPU | 1.9 | 1.1 |
