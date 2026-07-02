@@ -165,6 +165,26 @@ Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
 // nativeLoadModel
 // ---------------------------------------------------------------------------
 
+// Model-loading progress trampoline. The callback fires synchronously on the
+// thread executing nativeLoadModel, so the JNIEnv* and local refs in the
+// holder stay valid for the whole load. Returning false aborts the load.
+struct LoadProgressHolder {
+    JNIEnv*   env;
+    jobject   cb;
+    jmethodID onProgress;
+};
+
+static bool load_progress_trampoline(float progress, void* user_data) {
+    auto* h = static_cast<LoadProgressHolder*>(user_data);
+    jboolean keep_going = h->env->CallBooleanMethod(h->cb, h->onProgress, (jfloat) progress);
+    if (h->env->ExceptionCheck()) {
+        h->env->ExceptionClear();
+        LOGE("load progress callback threw — aborting load");
+        return false;
+    }
+    return keep_going == JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         JNIEnv* env,
@@ -172,7 +192,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jstring path,
         jint nGpuLayers,
         jint nCtx,
-        jint nThreads)
+        jint nThreads,
+        jobject progressCb)
 {
     auto* rnctx = new rnllama::llama_rn_context();
 
@@ -190,12 +211,30 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         p.cpuparams_batch.n_threads = static_cast<int32_t>(nThreads);
     }
 
-    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d",
+    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d",
          p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch,
-         nThreads > 0 ? nThreads : -1);
+         nThreads > 0 ? nThreads : -1, progressCb != nullptr);
 
-    if (!rnctx->loadModel(p)) {
-        LOGE("loadModel failed");
+    LoadProgressHolder holder{};
+    jclass cbClass = nullptr;
+    if (progressCb != nullptr) {
+        cbClass = env->GetObjectClass(progressCb);
+        holder.env = env;
+        holder.cb = progressCb;
+        holder.onProgress = env->GetMethodID(cbClass, "onProgress", "(F)Z");
+        if (holder.onProgress != nullptr) {
+            p.load_progress_callback = load_progress_trampoline;
+            p.load_progress_callback_user_data = &holder;
+        } else {
+            LOGE("loadModel: onProgress(F)Z not found, progress disabled");
+        }
+    }
+
+    const bool ok = rnctx->loadModel(p);
+    if (cbClass != nullptr) env->DeleteLocalRef(cbClass);
+
+    if (!ok) {
+        LOGE("loadModel failed (or aborted by progress callback)");
         delete rnctx;
         return 0L;
     }

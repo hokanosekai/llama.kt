@@ -30,6 +30,7 @@ import androidx.lifecycle.lifecycleScope
 import com.tensai.llamakt.BackendInfo
 import com.tensai.llamakt.ChatMessage
 import com.tensai.llamakt.LlamaEngine
+import com.tensai.llamakt.LoadProgressCallback
 import com.tensai.llamakt.SamplingParams
 import com.tensai.llamakt.chat
 import kotlinx.coroutines.*
@@ -651,7 +652,11 @@ class MainActivity : ComponentActivity() {
                                         if (!modelLoaded) {
                                             status = "Loading model (nGpuLayers=$nGpuLayers, threads=${if (nThreads == 0) "auto" else nThreads})…"
                                             withContext(Dispatchers.IO) {
-                                                engine.load(path, nGpuLayers, nCtx, nThreads)
+                                                engine.load(path, nGpuLayers, nCtx, nThreads,
+                                                    LoadProgressCallback { p ->
+                                                        status = "Loading model… ${(p * 100).toInt()}%"
+                                                        true
+                                                    })
                                             }
                                             modelLoaded = true
                                             activeBackendStr = withContext(Dispatchers.IO) {
@@ -834,7 +839,11 @@ class MainActivity : ComponentActivity() {
                                             if (!modelLoaded) {
                                                 status = "Loading model…"
                                                 withContext(Dispatchers.IO) {
-                                                    engine.load(path, nGpuLayers, nCtx, nThreads)
+                                                    engine.load(path, nGpuLayers, nCtx, nThreads,
+                                                        LoadProgressCallback { p ->
+                                                            status = "Loading model… ${(p * 100).toInt()}%"
+                                                            true
+                                                        })
                                                 }
                                                 modelLoaded = true
                                                 activeBackendStr = withContext(Dispatchers.IO) { engine.activeBackend() }

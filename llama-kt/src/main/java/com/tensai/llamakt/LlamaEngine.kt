@@ -45,6 +45,15 @@ data class BackendInfo(
     val type: String,
 )
 
+/**
+ * Model-loading progress callback. [onProgress] receives a value in 0.0–1.0
+ * and is called from the loading thread. Return true to continue loading,
+ * false to abort (load() will then throw).
+ */
+fun interface LoadProgressCallback {
+    fun onProgress(progress: Float): Boolean
+}
+
 class LlamaEngine {
 
     private var handle: Long = 0L
@@ -90,15 +99,23 @@ class LlamaEngine {
      *     detection fails.
      *   -1 → force llama.cpp auto-detect.
      *   > 0 → explicit thread count.
-     * Throws [IllegalStateException] if the native load fails.
+     * [onProgress] — optional loading progress (0.0–1.0), called from the
+     *   loading thread; return false to abort the load.
+     * Throws [IllegalStateException] if the native load fails or is aborted.
      */
-    fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0) {
+    fun load(
+        path: String,
+        nGpuLayers: Int = 0,
+        nCtx: Int = 4096,
+        nThreads: Int = 0,
+        onProgress: LoadProgressCallback? = null,
+    ) {
         val resolved = when {
             nThreads > 0 -> nThreads
             nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
             else -> 0                              // -1 → llama auto
         }
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved)
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -173,7 +190,10 @@ class LlamaEngine {
 
     private external fun nativeListBackends(): String
     private external fun nativeActiveBackend(h: Long): String
-    private external fun nativeLoadModel(path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int): Long
+    private external fun nativeLoadModel(
+        path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int,
+        progressCb: LoadProgressCallback?,
+    ): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
         h: Long, prompt: String,

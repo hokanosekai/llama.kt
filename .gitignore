@@ -40,3 +40,4 @@ llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan-shaders.hpp
 Thumbs.db
 
 # third_party/ — NOT ignored (will be git submodules)
+.kotlin/
