@@ -763,7 +763,7 @@ class MainActivity : ComponentActivity() {
                                     status = "No model loaded. Pick a GGUF first."
                                     return@startGeneration
                                 }
-                                output = ""
+                                if (!chatMode) output = ""  // chat keeps the transcript on screen
                                 tokPerSec = 0f
                                 kvUsed = 0
                                 currentRamMb = null
