@@ -40,12 +40,14 @@ OPPO CPH2251 — MediaTek Dimensity 900 (2×A78@2.4GHz + 6×A55@2.0GHz, Mali-G68
 | Gemma-3n-E2B-it | Q4_K_M | CPU | 1.9 | 1.1 |
 | | Q4_K_M | Vulkan | 1.8 | 1.9 |
 | | Q4_0 | **Vulkan + KV q8_0** | 1.8 | **2.1** |
+| Gemma-4-E2B-it | Q4_K_M | CPU | — | unusable (>420s) |
+| | Q4_K_M | **Vulkan** | 1.7 | **2.1** |
 | Qwen2.5-7B-Instruct | Q4_K_M | CPU | 1.4 | 0.2 |
 
 What the numbers say for this device class (UMA, no GPU matrix cores):
 
 - **Dense models run fastest on the big CPU cores.** The Vulkan backend loses on both prefill and decode — Mali has no cooperative-matrix path, so the GPU is bandwidth-bound through generic shaders.
-- **Gemma 3n is the exception**: its llama.cpp CPU path is disproportionately slow (per-layer embeddings), so full GPU offload is ~2× CPU. Prefill stays ~1.8 tok/s on every backend — a structural upstream limitation of the gemma3n graph, not a tuning problem.
+- **Gemma 3n and Gemma 4 are the exception**: their llama.cpp CPU path is disproportionately slow (per-layer embeddings — Gemma 4 E2B is outright unusable on CPU), so full GPU offload wins. Prefill stays ~1.8 tok/s on every backend — a structural upstream limitation of the PLE graph path, not a tuning problem. Output verified coherent on both generations.
 - **Partial GPU offload always loses** on UMA: every tested split (8/16/24 of 30 layers) was slower than either full CPU or full GPU, because graph-split synchronization costs more than the shared-memory GPU brings.
 - **The CPU rule has exceptions** — Phi-4-mini runs better on the GPU (2.3 vs 1.7), like Gemma 3n. Backend choice needs a per-architecture table, not a blanket rule.
 - **The practical size ceiling is memory pressure, not OOM — and it is backend-dependent.** A 7B Q4 (4.4GB) on CPU loads and survives but decodes at 0.2 tok/s: mmap'd weights are file-backed and evictable, so the kernel thrashes instead of killing. The same model on Vulkan gets hard-killed at load: weights are copied into Vulkan buffers (anonymous, unevictable, same physical RAM on UMA), and nothing can be reclaimed. On 8GB-class devices, ~4B quantized is the usable ceiling, and the GPU ceiling is stricter than the CPU one.
