@@ -105,10 +105,14 @@ class LlamaEngine {
     // nThreads: 0 = pin to big cores (default), -1 = llama.cpp auto, >0 = explicit
     // onProgress: loading progress 0.0-1.0, return false to abort the load
     // kvCacheType: null = f16, "q8_0" halves KV memory (~13% decode cost measured)
+    // flashAttn: null = auto, "on", "off" (never "off" with a quantized KV cache)
     fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0,
-             onProgress: LoadProgressCallback? = null, kvCacheType: String? = null)
+             onProgress: LoadProgressCallback? = null, kvCacheType: String? = null,
+             flashAttn: String? = null)
     fun completion(prompt: String, params: SamplingParams = SamplingParams(), callback: TokenCallback)
-    fun formatChat(messages: List<ChatMessage>): String
+    // enableThinking=false renders thinking models (Qwen3…) with reasoning disabled:
+    // measured 512 tokens / 106s -> 18 tokens / 7s on the same arithmetic prompt
+    fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String
     fun tokenize(text: String): IntArray
     fun kvUsed(): Int                 // KV cache cells used = context budget
     fun interrupt()                   // cancels an in-flight generation (incl. prefill)
@@ -132,6 +136,7 @@ data class GgufMetadata(
     val fileType: Int, val quantLabel: String,
     val contextLength: Long, val embeddingLength: Long, val blockCount: Long,
     val paramCount: Long, val vocabSize: Long, val fileSizeBytes: Long,
+    val supportsThinking: Boolean,  // detected from the chat template markers
 )
 
 fun interface LoadProgressCallback { fun onProgress(progress: Float): Boolean }
@@ -150,7 +155,8 @@ data class BackendInfo(val name: String, val description: String, val type: Stri
 fun interface TokenCallback { fun onToken(token: String) }
 
 // extensions (Flow)
-fun LlamaEngine.chat(messages: List<ChatMessage>, params: SamplingParams = SamplingParams()): Flow<String>
+fun LlamaEngine.chat(messages: List<ChatMessage>, params: SamplingParams = SamplingParams(),
+                     enableThinking: Boolean = true): Flow<String>
 fun LlamaEngine.decode(prompt: String, params: SamplingParams = SamplingParams()): Flow<String>   // raw, no template
 ```
 
@@ -158,11 +164,13 @@ Generation stops on the model's EOS token or after `SamplingParams.nPredict` tok
 
 Native llama.cpp/ggml logs (including `GGML_ABORT` assert messages) are forwarded to logcat under the `llama.cpp` tag, so native crashes are diagnosable from `adb logcat`.
 
-Context budget: `kvUsed()` returns cells used, compare against your `nCtx` to show a fill bar. Persist a conversation's KV with `saveSession`/`loadSession` (restore requires the same model + context params).
+**Multi-turn chat**: call `chat()` with the full growing message list every turn — the engine reuses the evaluated history from its KV cache (common-prefix matching) and only decodes the new suffix. Measured over 4 dependent turns (history 0 → 529 tokens): TTFT stays 1.7–2.4s where a full re-prefill would take ~48s. No manual cache management needed. The token stream is UTF-8 safe: multi-byte characters split across tokens (emoji, accents, CJK) are held back until complete.
+
+Context budget: `kvUsed()` returns cells used, compare against your `nCtx` to show a fill bar. Persist a conversation's KV with `saveSession`/`loadSession` (restore requires the same model + context params) — restoring skips the prompt re-evaluation entirely (measured TTFT 10.7s → 82ms across a process kill on a 171-token prompt). Note that a model reload (any load-time param change) wipes the KV cache: the next turn silently re-prefills the whole history unless you saved a session first.
 
 ## Example
 
-[`example/`](example/) is a Compose bench app — the reference integration. Pick a GGUF, choose backend (CPU/GPU) and thread count, tune sampling (max tokens, temperature, top-k, top-p), generate with live stats (tok/s, KV, RAM, CPU, collapsible graphs). Preset prompts include short-output "sampling test" chips to observe determinism/variance across runs.
+[`example/`](example/) is a Compose bench app — the reference integration. Pick a GGUF (shows a persistent model card from the header metadata), choose backend (CPU/GPU), threads, context size and KV cache type, tune sampling (max tokens, temperature, top-k, top-p, min-p, stop sequences, thinking toggle on capable models), generate with live stats (tok/s, KV, RAM, CPU, collapsible graphs). A **Chat** chip switches to conversational mode: each Generate appends a turn and resends the full history. Save/Load session buttons persist the KV to the app cache.
 
 It is also drivable headless from adb for benches and crash repros:
 
@@ -174,6 +182,8 @@ adb shell 'cat /sdcard/Download/model.gguf | run-as com.tensai.llamakt.example s
 adb shell am start -n com.tensai.llamakt.example/.MainActivity \
   --ez autorun true --ez gpu true --es prompt "Hello"
 ```
+
+Autorun extras: `gpu` (bool), `ngl` (int, explicit layer count), `prompt` (string), `temp` (float), `kv` (`q8_0`), `fa` (`on`/`off`), `think` (bool), `stops` (string array), `save`/`load` (bool, session round-trip), `turns` (string array — multi-turn conversation with per-turn TTFT logging).
 
 ## Building from source
 
