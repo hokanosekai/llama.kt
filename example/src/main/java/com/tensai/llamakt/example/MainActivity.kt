@@ -340,6 +340,12 @@ class MainActivity : ComponentActivity() {
         // Thinking mode for thinking-capable models (Qwen3…). Autorun extra "think".
         var enableThinking by remember { mutableStateOf(true) }
 
+        // Chat mode: accumulate turns so each Generate continues the
+        // conversation (full history resent; native prefix cache makes
+        // follow-up turns cheap). Off = single-shot bench behavior.
+        var chatMode by remember { mutableStateOf(false) }
+        val conversation = remember { mutableStateListOf<ChatMessage>() }
+
         // Live metric snapshots for stats strip
         var currentRamMb by remember { mutableStateOf<Float?>(null) }
         var currentCpuPct by remember { mutableStateOf<Float?>(null) }
@@ -634,11 +640,46 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    // ── Chat mode toggle + turn counter + reset ───────────────
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = chatMode,
+                            onClick = {
+                                if (!generating) {
+                                    chatMode = !chatMode
+                                    conversation.clear()
+                                    output = ""
+                                }
+                            },
+                            label = { Text("Chat") },
+                            enabled = !generating && !copying,
+                        )
+                        if (chatMode) {
+                            Text(
+                                "${conversation.size / 2} turns · KV $kvUsed",
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                            TextButton(
+                                onClick = {
+                                    if (!generating) {
+                                        conversation.clear()
+                                        output = ""
+                                        status = "Conversation cleared."
+                                    }
+                                },
+                                enabled = !generating && conversation.isNotEmpty(),
+                            ) { Text("Clear") }
+                        }
+                    }
+
                     // ── Prompt field ──────────────────────────────────────────
                     OutlinedTextField(
                         value = prompt,
                         onValueChange = { prompt = it },
-                        label = { Text("Prompt") },
+                        label = { Text(if (chatMode) "Your message" else "Prompt") },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !generating,
                     )
@@ -769,7 +810,11 @@ class MainActivity : ComponentActivity() {
 
                                         var lastSampleMs = 0L
 
-                                        val messages = listOf(ChatMessage("user", prompt))
+                                        val userMessage = ChatMessage("user", prompt)
+                                        val messages = if (chatMode) conversation + userMessage
+                                                       else listOf(userMessage)
+                                        val replyBuilder = StringBuilder()
+                                        if (chatMode && output.isNotEmpty()) output += "\n\n— you: $prompt\n"
                                         val sampling = SamplingParams(
                                             nPredict = maxTokens.toInt(),
                                             temperature = temperature,
@@ -780,6 +825,7 @@ class MainActivity : ComponentActivity() {
                                         )
                                         engine.chat(messages, sampling, enableThinking).collect { token ->
                                             output += token
+                                            replyBuilder.append(token)
                                             tokenCount++
                                             if (firstTokenMs == 0L) firstTokenMs = System.currentTimeMillis()
 
@@ -830,6 +876,12 @@ class MainActivity : ComponentActivity() {
                                         kvUsed = engine.kvUsed()
                                         status = "Done — $tokenCount tokens in %.1fs (%.1f tok/s) [$activeBackendStr]"
                                             .format(elapsedSec, tokPerSec)
+                                        if (chatMode) {
+                                            conversation.add(userMessage)
+                                            conversation.add(ChatMessage("assistant", replyBuilder.toString()))
+                                            prompt = ""
+                                        }
+
                                         val ttftMs = if (firstTokenMs > 0L) firstTokenMs - startMs else -1L
                                         // Prompt size = KV used minus generated tokens; prefill
                                         // speed = prompt tokens / time to first token. Decode
