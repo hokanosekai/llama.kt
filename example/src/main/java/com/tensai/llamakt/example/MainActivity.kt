@@ -349,7 +349,9 @@ class MainActivity : ComponentActivity() {
 
         // Sampling controls — defaults match llama.cpp / SamplingParams
         var showSampling by remember { mutableStateOf(false) }
-        var maxTokens by remember { mutableStateOf(512f) }
+        // 2048 default: thinking/verbose models blow through 512 and get cut
+        // mid-answer. EOS still ends normal replies way before the cap.
+        var maxTokens by remember { mutableStateOf(2048f) }
         var temperature by remember { mutableStateOf(0.8f) }
         var topK by remember { mutableStateOf(40f) }
         var topP by remember { mutableStateOf(0.95f) }
