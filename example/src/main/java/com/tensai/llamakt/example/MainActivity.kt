@@ -478,9 +478,10 @@ class MainActivity : ComponentActivity() {
                     // ── Persistent model card (survives generation) ───────────
                     modelMeta?.let { m ->
                         Text(
-                            "%s · %s · %.2fB params · ctx %d · %d layers · %d MB".format(
+                            "%s · %s · %.2fB params · ctx %d · %d layers · %d MB%s".format(
                                 m.architecture, m.quantLabel, m.paramCount / 1e9,
                                 m.contextLength, m.blockCount, m.fileSizeBytes / 1_048_576,
+                                if (m.supportsThinking) " · 🧠" else "",
                             ),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.tertiary,
@@ -699,22 +700,14 @@ class MainActivity : ComponentActivity() {
                                 enabled = !generating,
                                 textStyle = MaterialTheme.typography.bodySmall,
                             )
-                            // Prompt-time toggle (no reload) — only affects
-                            // thinking-capable models (Qwen3, …)
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
+                            // Prompt-time toggle (no reload) — shown only when
+                            // the loaded model's chat template supports thinking
+                            if (modelMeta?.supportsThinking == true) {
                                 FilterChip(
                                     selected = enableThinking,
                                     onClick = { if (!generating) enableThinking = !enableThinking },
                                     label = { Text("Thinking") },
                                     enabled = !generating,
-                                )
-                                Text(
-                                    "reasoning models only (Qwen3…)",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.outlineVariant,
                                 )
                             }
                         }

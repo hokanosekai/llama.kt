@@ -224,6 +224,16 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         if (i >= 0) vocab = lm_gguf_get_arr_n(gctx, i);
     }
 
+    // Thinking capability: no dedicated GGUF key — detect from the chat
+    // template (jinja string in the header). Thinking-capable templates
+    // reference enable_thinking (Qwen3) or emit <think> blocks.
+    bool supports_thinking = false;
+    {
+        const std::string tmpl = get_str("tokenizer.chat_template");
+        supports_thinking = tmpl.find("enable_thinking") != std::string::npos
+                         || tmpl.find("<think>") != std::string::npos;
+    }
+
     struct stat st{};
     const uint64_t file_size = (stat(fpath.c_str(), &st) == 0)
         ? static_cast<uint64_t>(st.st_size) : 0;
@@ -238,6 +248,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         {"param_count",      n_params},
         {"vocab_size",       vocab},
         {"file_size_bytes",  file_size},
+        {"supports_thinking", supports_thinking},
     };
 
     lm_gguf_free(gctx);

@@ -73,6 +73,8 @@ data class GgufMetadata(
     val paramCount: Long,
     val vocabSize: Long,
     val fileSizeBytes: Long,
+    /** Detected from the chat template (enable_thinking / <think> markers). */
+    val supportsThinking: Boolean,
 )
 
 class LlamaEngine {
@@ -280,6 +282,7 @@ class LlamaEngine {
                     paramCount      = obj.optLong("param_count", 0),
                     vocabSize       = obj.optLong("vocab_size", 0),
                     fileSizeBytes   = obj.optLong("file_size_bytes", 0),
+                    supportsThinking = obj.optBoolean("supports_thinking", false),
                 )
             } catch (_: Exception) { null }
         }
