@@ -589,14 +589,6 @@ class MainActivity : ComponentActivity() {
                                 enabled = !generating && !copying,
                             )
                         }
-                        // Prompt-time toggle (no reload needed) — only affects
-                        // thinking-capable models (Qwen3, …)
-                        FilterChip(
-                            selected = enableThinking,
-                            onClick = { if (!generating) enableThinking = !enableThinking },
-                            label = { Text("Think") },
-                            enabled = !generating && !copying,
-                        )
                     }
 
                     // ── Preset chips ──────────────────────────────────────────
@@ -707,6 +699,24 @@ class MainActivity : ComponentActivity() {
                                 enabled = !generating,
                                 textStyle = MaterialTheme.typography.bodySmall,
                             )
+                            // Prompt-time toggle (no reload) — only affects
+                            // thinking-capable models (Qwen3, …)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                FilterChip(
+                                    selected = enableThinking,
+                                    onClick = { if (!generating) enableThinking = !enableThinking },
+                                    label = { Text("Thinking") },
+                                    enabled = !generating,
+                                )
+                                Text(
+                                    "reasoning models only (Qwen3…)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outlineVariant,
+                                )
+                            }
                         }
                     }
 
