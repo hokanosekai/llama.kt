@@ -81,6 +81,41 @@ static std::string jstring_to_std(JNIEnv* env, jstring js) {
     return result;
 }
 
+// A llama.cpp token can end mid-way through a multi-byte UTF-8 character
+// (one visible char can span several tokens — emoji, accents, CJK).
+// Passing those partial bytes to NewStringUTF aborts the VM
+// ("JNI DETECTED ERROR: input is not valid Modified UTF-8").
+//
+// Splits buf into an emittable part (complete, valid sequences only —
+// stray invalid bytes are dropped) and leaves the trailing incomplete
+// sequence in buf, to be completed by the next token.
+static std::string utf8_take_complete(std::string& buf) {
+    const size_t n = buf.size();
+    std::string out;
+    out.reserve(n);
+    size_t i = 0;
+    size_t tail_start = n;  // start of the trailing incomplete sequence
+    while (i < n) {
+        const unsigned char c = buf[i];
+        size_t len;
+        if      (c < 0x80)           len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else { i++; continue; }      // invalid lead byte — drop it
+        if (i + len > n) { tail_start = i; break; }  // incomplete tail — hold back
+        bool ok = true;
+        for (size_t k = 1; k < len; k++) {
+            if ((static_cast<unsigned char>(buf[i + k]) & 0xC0) != 0x80) { ok = false; break; }
+        }
+        if (!ok) { i++; continue; }  // invalid continuation — drop lead byte, rescan
+        out.append(buf, i, len);
+        i += len;
+    }
+    buf.erase(0, tail_start);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // nativeListBackends  (static — no model required)
 // ---------------------------------------------------------------------------
@@ -452,9 +487,14 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     // Begin generation
     comp->beginCompletion();
 
+    // UTF-8 holdback buffer: only complete sequences ever reach NewStringUTF.
+    std::string utf8_buf;
     auto emit = [&](const std::string& s) {
         if (s.empty()) return;
-        jstring jtok = env->NewStringUTF(s.c_str());
+        utf8_buf += s;
+        const std::string ready = utf8_take_complete(utf8_buf);
+        if (ready.empty()) return;
+        jstring jtok = env->NewStringUTF(ready.c_str());
         env->CallVoidMethod(cb, onToken, jtok);
         env->DeleteLocalRef(jtok);
     };
@@ -505,7 +545,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     }
 
     // Generation ended without a stop match (EOS / n_predict / interrupt):
-    // flush whatever was held back.
+    // flush whatever was held back. Anything still in utf8_buf after this
+    // is an incomplete sequence that can never render — dropped by design.
     if (!pending.empty() && !comp->is_interrupted) {
         emit(pending);
     }
