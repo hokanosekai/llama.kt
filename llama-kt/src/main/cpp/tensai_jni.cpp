@@ -515,7 +515,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
         JNIEnv* env,
         jobject /* thiz */,
         jlong   h,
-        jstring messagesJson)
+        jstring messagesJson,
+        jboolean enableThinking)
 {
     if (h == 0L) return env->NewStringUTF("");
     auto* rnctx = to_ctx(h);
@@ -524,17 +525,37 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
 
     std::string formatted;
     try {
-        // Pass empty chat_template → use the template stored in the GGUF via
-        // rnctx->templates (initialized from the model in loadModel).
-        // add_generation_prompt defaults to true in common_chat_templates_inputs,
-        // so the assistant prefix is automatically appended.
-        formatted = rnctx->getFormattedChat(msgs, /* chat_template= */ "");
+        // Jinja path: honors enable_thinking (Qwen3 & other thinking models
+        // render an empty think block / no think prompt when disabled).
+        // Empty chat_template → template stored in the GGUF (rnctx->templates).
+        // add_generation_prompt = true appends the assistant prefix.
+        formatted = rnctx->getFormattedChatWithJinja(
+            msgs,
+            /* chat_template     */ "",
+            /* json_schema       */ "",
+            /* tools             */ "",
+            /* parallel_tool_call*/ false,
+            /* tool_choice       */ "",
+            /* enable_thinking   */ enableThinking == JNI_TRUE,
+            /* reasoning_format  */ "none",  // "" throws (Unknown reasoning format); none = raw passthrough
+            /* add_generation_prompt */ true,
+            /* now_str           */ "",
+            /* chat_template_kwargs */ {},
+            /* force_pure_content*/ false
+        ).prompt;
     } catch (const std::exception& e) {
-        LOGE("nativeFormatChat: exception: %s", e.what());
-        return env->NewStringUTF("");
+        // Some templates fail under jinja — fall back to the legacy path
+        // (no thinking control there).
+        LOGE("nativeFormatChat: jinja failed (%s), falling back to legacy", e.what());
+        try {
+            formatted = rnctx->getFormattedChat(msgs, "");
+        } catch (const std::exception& e2) {
+            LOGE("nativeFormatChat: exception: %s", e2.what());
+            return env->NewStringUTF("");
+        }
     }
 
-    LOGI("nativeFormatChat: formatted %zu chars", formatted.size());
+    LOGI("nativeFormatChat: formatted %zu chars (thinking=%d)", formatted.size(), enableThinking);
     return env->NewStringUTF(formatted.c_str());
 }
 

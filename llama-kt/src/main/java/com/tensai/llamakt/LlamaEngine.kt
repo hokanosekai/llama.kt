@@ -186,8 +186,14 @@ class LlamaEngine {
      * Apply the model's built-in chat template (embedded in the GGUF) to
      * [messages] and return the fully formatted prompt string.
      * Works with any model — Qwen, Llama, Mistral, etc.
+     *
+     * [enableThinking] — thinking-capable models (Qwen3, …) reason inside
+     *   <think>…</think> before answering. true (default) keeps that;
+     *   false renders the template with thinking disabled: faster first
+     *   visible token, at some quality cost on hard prompts. No effect on
+     *   models without a thinking template.
      */
-    fun formatChat(messages: List<ChatMessage>): String {
+    fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String {
         val arr = JSONArray()
         for (msg in messages) {
             val obj = JSONObject()
@@ -195,7 +201,7 @@ class LlamaEngine {
             obj.put("content", msg.content)
             arr.put(obj)
         }
-        return nativeFormatChat(handle, arr.toString())
+        return nativeFormatChat(handle, arr.toString(), enableThinking)
     }
 
     /**
@@ -232,7 +238,7 @@ class LlamaEngine {
         stopSequences: Array<String>,
         cb: TokenCallback,
     )
-    private external fun nativeFormatChat(h: Long, messagesJson: String): String
+    private external fun nativeFormatChat(h: Long, messagesJson: String, enableThinking: Boolean): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int
     private external fun nativeInterrupt(h: Long)

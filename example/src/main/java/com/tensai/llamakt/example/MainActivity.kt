@@ -337,6 +337,9 @@ class MainActivity : ComponentActivity() {
         // Flash attention: null = auto. Settable via autorun extra "fa" ("on"/"off").
         var flashAttn by remember { mutableStateOf<String?>(null) }
 
+        // Thinking mode for thinking-capable models (Qwen3…). Autorun extra "think".
+        var enableThinking by remember { mutableStateOf(true) }
+
         // Live metric snapshots for stats strip
         var currentRamMb by remember { mutableStateOf<Float?>(null) }
         var currentCpuPct by remember { mutableStateOf<Float?>(null) }
@@ -586,6 +589,14 @@ class MainActivity : ComponentActivity() {
                                 enabled = !generating && !copying,
                             )
                         }
+                        // Prompt-time toggle (no reload needed) — only affects
+                        // thinking-capable models (Qwen3, …)
+                        FilterChip(
+                            selected = enableThinking,
+                            onClick = { if (!generating) enableThinking = !enableThinking },
+                            label = { Text("Think") },
+                            enabled = !generating && !copying,
+                        )
                     }
 
                     // ── Preset chips ──────────────────────────────────────────
@@ -762,7 +773,7 @@ class MainActivity : ComponentActivity() {
                                             minP = minP,
                                             stopSequences = stopSequences,
                                         )
-                                        engine.chat(messages, sampling).collect { token ->
+                                        engine.chat(messages, sampling, enableThinking).collect { token ->
                                             output += token
                                             tokenCount++
                                             if (firstTokenMs == 0L) firstTokenMs = System.currentTimeMillis()
@@ -869,6 +880,7 @@ class MainActivity : ComponentActivity() {
                                 if (intent.hasExtra("temp")) temperature = intent.getFloatExtra("temp", 0.8f)
                                 if (intent.hasExtra("ngl")) nglOverride = intent.getIntExtra("ngl", -1)
                                 flashAttn = intent.getStringExtra("fa")
+                                enableThinking = intent.getBooleanExtra("think", true)
                                 android.util.Log.i("LlamaKtBench", "autorun: gpu=$useGpu model=${cached.length() / 1_048_576}MB")
                                 LlamaEngine.readMetadata(cached.absolutePath)?.let { m ->
                                     modelMeta = m

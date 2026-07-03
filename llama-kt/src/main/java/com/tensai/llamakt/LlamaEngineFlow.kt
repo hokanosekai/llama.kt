@@ -44,7 +44,8 @@ fun LlamaEngine.decode(
 fun LlamaEngine.chat(
     messages: List<ChatMessage>,
     params: SamplingParams = SamplingParams(),
+    enableThinking: Boolean = true,
 ): Flow<String> {
-    val prompt = formatChat(messages)
+    val prompt = formatChat(messages, enableThinking)
     return decode(prompt, params)
 }
