@@ -31,17 +31,24 @@ OPPO CPH2251 — MediaTek Dimensity 900 (2×A78@2.4GHz + 6×A55@2.0GHz, Mali-G68
 | | | Vulkan | 7.0 | 9.0 |
 | Gemma-3-1B-it | Q4_K_M | **CPU** | 10.9 | **6.0** |
 | | | Vulkan | 3.7 | 5.4 |
+| Qwen3-1.7B (thinking) | Q4_K_M | **CPU** | 8.6 | **5.9** |
+| | | Vulkan | 2.1 | 4.2 |
 | Llama-3.2-3B-Instruct | Q4_K_M | **CPU** | 6.0 | **3.9** |
 | | | Vulkan | 1.2 | 2.9 |
+| Phi-4-mini (3.8B) | Q4_K_M | CPU | 3.9 | 1.7 |
+| | | **Vulkan** | 0.8 | **2.3** |
 | Gemma-3n-E2B-it | Q4_K_M | CPU | 1.9 | 1.1 |
 | | Q4_K_M | Vulkan | 1.8 | 1.9 |
 | | Q4_0 | **Vulkan + KV q8_0** | 1.8 | **2.1** |
+| Qwen2.5-7B-Instruct | Q4_K_M | CPU | 1.4 | 0.2 |
 
 What the numbers say for this device class (UMA, no GPU matrix cores):
 
 - **Dense models run fastest on the big CPU cores.** The Vulkan backend loses on both prefill and decode — Mali has no cooperative-matrix path, so the GPU is bandwidth-bound through generic shaders.
 - **Gemma 3n is the exception**: its llama.cpp CPU path is disproportionately slow (per-layer embeddings), so full GPU offload is ~2× CPU. Prefill stays ~1.8 tok/s on every backend — a structural upstream limitation of the gemma3n graph, not a tuning problem.
 - **Partial GPU offload always loses** on UMA: every tested split (8/16/24 of 30 layers) was slower than either full CPU or full GPU, because graph-split synchronization costs more than the shared-memory GPU brings.
+- **The CPU rule has exceptions** — Phi-4-mini runs better on the GPU (2.3 vs 1.7), like Gemma 3n. Backend choice needs a per-architecture table, not a blanket rule.
+- **The practical size ceiling is memory pressure, not OOM.** A 7B Q4 (4.4GB) loads and survives but decodes at 0.2 tok/s: the weights no longer fit in the page cache next to the OS, and every token re-reads from flash (mmap thrashing). On 8GB-class devices, ~4B quantized is the usable ceiling.
 - **KV cache q8_0** helps decode on the bandwidth-bound GPU for Gemma (+7%), costs ~13% on CPU, and is neutral-to-negative elsewhere. It requires flash attention (quantized V cache), so never combine it with `flashAttn = "off"`.
 
 **Reference point — Google AI Edge Gallery** (LiteRT-LM, same device, same prompt, Gemma 3n E2B-it, runtime-selected CPU): ~2.4–3.0 tok/s estimated from the on-screen timer and word counts (the app does not report tok/s; timer includes prefill, token counts estimated, int4 LiteRT quant vs our Q4). Google's vertical stack for its own model family runs ~1.3× our best GGUF config on this hardware — the price of running arbitrary GGUFs instead of one compiled model format.
