@@ -865,6 +865,46 @@ class MainActivity : ComponentActivity() {
                                 }
                     }
 
+                    // Multi-turn conversation driver (TEN-16): runs each turn
+                    // through chat() with the full growing history, logging
+                    // TTFT per turn. Constant TTFT across turns = the native
+                    // prefix cache is reusing the history KV; growing TTFT =
+                    // full re-prefill each turn.
+                    suspend fun runConversation(turns: List<String>) {
+                        val path = localPath ?: return
+                        if (!modelLoaded) {
+                            withContext(Dispatchers.IO) { engine.load(path, nGpuLayers, nCtx, nThreads) }
+                            modelLoaded = true
+                            activeBackendStr = withContext(Dispatchers.IO) { engine.activeBackend() }
+                        }
+                        val conversation = mutableListOf<ChatMessage>()
+                        turns.forEachIndexed { i, userMsg ->
+                            conversation.add(ChatMessage("user", userMsg))
+                            val historyTokens = engine.kvUsed()
+                            val reply = StringBuilder()
+                            var firstMs = 0L
+                            val startMs = System.currentTimeMillis()
+                            generating = true
+                            status = "Turn ${i + 1}/${turns.size}…"
+                            engine.chat(conversation, SamplingParams(nPredict = 192), enableThinking).collect { tok ->
+                                if (firstMs == 0L) firstMs = System.currentTimeMillis()
+                                reply.append(tok)
+                                output += tok
+                            }
+                            generating = false
+                            conversation.add(ChatMessage("assistant", reply.toString()))
+                            val ttft = if (firstMs > 0) firstMs - startMs else -1
+                            android.util.Log.i(
+                                "LlamaKtBench",
+                                "turn=${i + 1} kv_before=$historyTokens kv_after=${engine.kvUsed()} " +
+                                    "ttft=${ttft}ms reply_chars=${reply.length}",
+                            )
+                            output += "\n---\n"
+                        }
+                        status = "Conversation done (${turns.size} turns)."
+                        android.util.Log.i("LlamaKtBench", "conversation complete")
+                    }
+
                     // Headless autorun for adb-driven repro loops:
                     //   adb shell am start -n com.tensai.llamakt.example/.MainActivity \
                     //     --ez autorun true --ez gpu true [--es prompt "..."]
@@ -891,7 +931,12 @@ class MainActivity : ComponentActivity() {
                                     modelMeta = m
                                     android.util.Log.i("LlamaKtBench", "metadata: arch=${m.architecture} name=${m.name} quant=${m.quantLabel} params=${m.paramCount} ctx=${m.contextLength} embd=${m.embeddingLength} layers=${m.blockCount} vocab=${m.vocabSize} size=${m.fileSizeBytes}")
                                 }
-                                startGeneration()
+                                val turns = intent.getStringArrayExtra("turns")
+                                if (turns != null && turns.isNotEmpty()) {
+                                    runConversation(turns.toList())
+                                } else {
+                                    startGeneration()
+                                }
                             } else {
                                 status = "autorun: no cached model.gguf"
                             }
