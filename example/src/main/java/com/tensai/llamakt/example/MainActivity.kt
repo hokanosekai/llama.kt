@@ -792,6 +792,12 @@ class MainActivity : ComponentActivity() {
                                                 engine.activeBackend()
                                             }
                                             status = "Model loaded [$activeBackendStr]. Generating…"
+                                            // A reload wipes the KV cache: with chat history the
+                                            // whole conversation gets re-prefilled before the
+                                            // first token (minutes at CPU prefill speeds).
+                                            if (chatMode && conversation.isNotEmpty()) {
+                                                status = "Model reloaded — re-prefilling ${conversation.size / 2} turns of history, first token may take a while…"
+                                            }
                                         }
 
                                         if (autorunLoadSession) {
