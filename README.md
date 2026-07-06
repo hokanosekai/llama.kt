@@ -2,7 +2,7 @@
 
 Kotlin/Android JNI binding for [llama.cpp](https://github.com/ggml-org/llama.cpp). Loads any GGUF model and runs inference on-device — no server, no cloud. The native C++ engine is extracted from [llama.rn](https://github.com/mybigday/llama.rn) (React Native binding), stripped of the RN layer and re-exposed through a plain Kotlin API.
 
-Built as the inference layer for the [tensai](https://tens.ai) app, but usable standalone.
+Built as the inference layer for the tensai app, but usable standalone.
 
 ## Status
 
@@ -205,10 +205,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 
 ## Roadmap
 
-- **Published AAR** (Maven Central) — install with `implementation("io.github.hokanosekai:llama-kt:…")` instead of a git submodule. The submodule path stays supported; this is about lowering the barrier to consume the lib.
-- **Runtime backend auto-selection** — pick Vulkan / OpenCL / CPU per device automatically, with a manual override.
-- **CPU per-feature dispatch** — ship multiple CPU variants (baseline / dotprod / i8mm / SVE) and select at runtime, to keep i8mm speed on capable cores without crashing older ones.
-- **Multimodal** — wire the vendored `mtmd` (vision) through the Kotlin API.
+See [ROADMAP.md](ROADMAP.md). Next up (v1.1): published AAR on Maven Central, CPU per-feature dispatch, runtime backend auto-selection, multimodal (`mtmd`).
 
 ## License
 
