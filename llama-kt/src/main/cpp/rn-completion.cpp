@@ -30,6 +30,12 @@ llama_rn_context_completion::~llama_rn_context_completion() {
     }
 }
 
+// See declaration in rn-completion.h for why this exists (TEN-17).
+bool llama_rn_context_completion::abortCallback(void *data) {
+    auto *comp = static_cast<llama_rn_context_completion *>(data);
+    return comp != nullptr && comp->is_interrupted;
+}
+
 void llama_rn_context_completion::rewind() {
     resetSpeculative();
     is_interrupted = false;
@@ -548,14 +554,34 @@ completion_token_output llama_rn_context_completion::nextToken()
         {
             n_eval = parent_ctx->params.n_batch;
         }
-        if (llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval)))
+        const int32_t decode_ret = llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval));
+        if (decode_ret != 0)
         {
-            LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
-                n_eval,
-                n_past,
-                parent_ctx->params.cpuparams.n_threads,
-                tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
-            );
+            if (decode_ret == 2) {
+                // Aborted mid-graph by abortCallback() (is_interrupted set via
+                // nativeInterrupt) rather than a real decode failure. llama_decode()
+                // has already rolled back the in-flight ubatch's memory/KV entries
+                // itself before returning (see llama-context.cpp: on
+                // GGML_STATUS_ABORTED it calls memory->seq_rm() for the ubatch that
+                // was interrupted, and returns 2 without committing it (only
+                // ubatches that fully completed earlier in this call remain
+                // committed). So the memory module is left coherent, never
+                // half-written. We deliberately do NOT advance n_past here: it
+                // stays at the value from before this llama_decode() call, which
+                // matches or undershoots what's actually committed (a prior
+                // ubatch inside the same call may have completed and stayed
+                // committed even though n_past isn't bumped for it). That's safe,
+                // not stale-corrupt: the next completion resumes from n_past and
+                // will simply recompute/overwrite those positions.
+                LOG_INFO("Decoding Interrupted mid-eval (n_past: %d, n_eval: %d)", n_past, n_eval);
+            } else {
+                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
+                    n_eval,
+                    n_past,
+                    parent_ctx->params.cpuparams.n_threads,
+                    tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
+                );
+            }
             has_next_token = false;
             return result;
         }

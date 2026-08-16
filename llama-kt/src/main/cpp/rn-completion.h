@@ -102,6 +102,22 @@ struct llama_rn_context_completion {
     // Destructor
     ~llama_rn_context_completion();
 
+    // Abort callback wired via llama_set_abort_callback() in
+    // llama_rn_context::loadModel(), with `this` as the callback data.
+    // ggml checks this after every graph node it executes on the CPU
+    // backend (ggml-cpu.c, ggml_graph_compute_thread()), so it gives
+    // sub-batch abort latency instead of only between llama_decode()
+    // calls (TEN-17: the previous is_interrupted check in nextToken()
+    // only ran between chunks, so a single large prefill batch could
+    // not be cancelled until it finished entirely).
+    // NOTE: only the CPU ggml backend implements
+    // ggml_backend_set_abort_callback (Vulkan/OpenCL do not), so on a
+    // GPU-offloaded context (n_gpu_layers > 0) this callback is not
+    // consulted for the ops that actually run on the GPU backend. It
+    // still helps for whatever falls back to CPU in a mixed schedule,
+    // and is a no-op regression risk otherwise (see nextToken()).
+    static bool abortCallback(void *data);
+
     // Completion processing methods
     void rewind();
     bool initSampling();

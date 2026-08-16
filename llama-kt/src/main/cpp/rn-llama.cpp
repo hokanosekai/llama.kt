@@ -222,6 +222,14 @@ llama_rn_context::~llama_rn_context() {
     removeLoraAdapters();
     cleanupThreadpools();
 
+    // Drop the abort callback before freeing its data (completion): ctx
+    // itself is torn down right after this destructor body runs (llama_init
+    // member destruction), so there's no real use-after-free window today,
+    // but this keeps it that way if teardown order ever changes.
+    if (ctx != nullptr && completion != nullptr) {
+        llama_set_abort_callback(ctx, nullptr, nullptr);
+    }
+
     if (completion != nullptr) {
         delete completion;
         completion = nullptr;
@@ -307,6 +315,13 @@ bool llama_rn_context::loadModel(common_params &params_)
         delete completion;
     }
     completion = new llama_rn_context_completion(this);
+
+    // TEN-17: let ggml check is_interrupted mid-graph (per node) instead of
+    // only between llama_decode() calls, so cancelling during a long prefill
+    // doesn't have to wait for the whole batch. See abortCallback() in
+    // rn-completion.h/.cpp for what this does and its (CPU-backend-only)
+    // limits.
+    llama_set_abort_callback(ctx, llama_rn_context_completion::abortCallback, completion);
 
     // Initialize context shift flag
     LOG_INFO("ctx_shift: %s", params.ctx_shift ? "enabled" : "disabled");

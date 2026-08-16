@@ -1,0 +1,119 @@
+diff --git a/llama-kt/src/main/cpp/rn-completion.cpp b/llama-kt/src/main/cpp/rn-completion.cpp
+index f7240ad..2a25932 100644
+--- a/llama-kt/src/main/cpp/rn-completion.cpp
++++ b/llama-kt/src/main/cpp/rn-completion.cpp
+@@ -30,6 +30,12 @@ llama_rn_context_completion::~llama_rn_context_completion() {
+     }
+ }
+ 
++// See declaration in rn-completion.h for why this exists (TEN-17).
++bool llama_rn_context_completion::abortCallback(void *data) {
++    auto *comp = static_cast<llama_rn_context_completion *>(data);
++    return comp != nullptr && comp->is_interrupted;
++}
++
+ void llama_rn_context_completion::rewind() {
+     resetSpeculative();
+     is_interrupted = false;
+@@ -548,14 +554,34 @@ completion_token_output llama_rn_context_completion::nextToken()
+         {
+             n_eval = parent_ctx->params.n_batch;
+         }
+-        if (llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval)))
++        const int32_t decode_ret = llama_decode(parent_ctx->ctx, llama_batch_get_one(&embd[n_past], n_eval));
++        if (decode_ret != 0)
+         {
+-            LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
+-                n_eval,
+-                n_past,
+-                parent_ctx->params.cpuparams.n_threads,
+-                tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
+-            );
++            if (decode_ret == 2) {
++                // Aborted mid-graph by abortCallback() (is_interrupted set via
++                // nativeInterrupt) rather than a real decode failure. llama_decode()
++                // has already rolled back the in-flight ubatch's memory/KV entries
++                // itself before returning (see llama-context.cpp: on
++                // GGML_STATUS_ABORTED it calls memory->seq_rm() for the ubatch that
++                // was interrupted, and returns 2 without committing it (only
++                // ubatches that fully completed earlier in this call remain
++                // committed). So the memory module is left coherent, never
++                // half-written. We deliberately do NOT advance n_past here: it
++                // stays at the value from before this llama_decode() call, which
++                // matches or undershoots what's actually committed (a prior
++                // ubatch inside the same call may have completed and stayed
++                // committed even though n_past isn't bumped for it). That's safe,
++                // not stale-corrupt: the next completion resumes from n_past and
++                // will simply recompute/overwrite those positions.
++                LOG_INFO("Decoding Interrupted mid-eval (n_past: %d, n_eval: %d)", n_past, n_eval);
++            } else {
++                LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
++                    n_eval,
++                    n_past,
++                    parent_ctx->params.cpuparams.n_threads,
++                    tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
++                );
++            }
+             has_next_token = false;
+             return result;
+         }
+diff --git a/llama-kt/src/main/cpp/rn-completion.h b/llama-kt/src/main/cpp/rn-completion.h
+index bb5992c..af1879d 100644
+--- a/llama-kt/src/main/cpp/rn-completion.h
++++ b/llama-kt/src/main/cpp/rn-completion.h
+@@ -102,6 +102,22 @@ struct llama_rn_context_completion {
+     // Destructor
+     ~llama_rn_context_completion();
+ 
++    // Abort callback wired via llama_set_abort_callback() in
++    // llama_rn_context::loadModel(), with `this` as the callback data.
++    // ggml checks this after every graph node it executes on the CPU
++    // backend (ggml-cpu.c, ggml_graph_compute_thread()), so it gives
++    // sub-batch abort latency instead of only between llama_decode()
++    // calls (TEN-17: the previous is_interrupted check in nextToken()
++    // only ran between chunks, so a single large prefill batch could
++    // not be cancelled until it finished entirely).
++    // NOTE: only the CPU ggml backend implements
++    // ggml_backend_set_abort_callback (Vulkan/OpenCL do not), so on a
++    // GPU-offloaded context (n_gpu_layers > 0) this callback is not
++    // consulted for the ops that actually run on the GPU backend. It
++    // still helps for whatever falls back to CPU in a mixed schedule,
++    // and is a no-op regression risk otherwise (see nextToken()).
++    static bool abortCallback(void *data);
++
+     // Completion processing methods
+     void rewind();
+     bool initSampling();
+diff --git a/llama-kt/src/main/cpp/rn-llama.cpp b/llama-kt/src/main/cpp/rn-llama.cpp
+index 9305740..03e6ce2 100644
+--- a/llama-kt/src/main/cpp/rn-llama.cpp
++++ b/llama-kt/src/main/cpp/rn-llama.cpp
+@@ -222,6 +222,14 @@ llama_rn_context::~llama_rn_context() {
+     removeLoraAdapters();
+     cleanupThreadpools();
+ 
++    // Drop the abort callback before freeing its data (completion): ctx
++    // itself is torn down right after this destructor body runs (llama_init
++    // member destruction), so there's no real use-after-free window today,
++    // but this keeps it that way if teardown order ever changes.
++    if (ctx != nullptr && completion != nullptr) {
++        llama_set_abort_callback(ctx, nullptr, nullptr);
++    }
++
+     if (completion != nullptr) {
+         delete completion;
+         completion = nullptr;
+@@ -308,6 +316,13 @@ bool llama_rn_context::loadModel(common_params &params_)
+     }
+     completion = new llama_rn_context_completion(this);
+ 
++    // TEN-17: let ggml check is_interrupted mid-graph (per node) instead of
++    // only between llama_decode() calls, so cancelling during a long prefill
++    // doesn't have to wait for the whole batch. See abortCallback() in
++    // rn-completion.h/.cpp for what this does and its (CPU-backend-only)
++    // limits.
++    llama_set_abort_callback(ctx, llama_rn_context_completion::abortCallback, completion);
++
+     // Initialize context shift flag
+     LOG_INFO("ctx_shift: %s", params.ctx_shift ? "enabled" : "disabled");
+ 
