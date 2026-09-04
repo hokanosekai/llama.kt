@@ -990,7 +990,40 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
     );
 
     if (!ok) {
-        LOGE("nativeLoadSession: llama_state_load_file failed, path=%s", spath.c_str());
+        // llama_state_load_file can fail *after* wiping the KV cache:
+        // llama_kv_cache::state_read_meta() calls clear(true) before reading
+        // cells back, and both failure exits below it leave the cache empty or
+        // half-populated. Returning -1 as-is would keep embd/n_past describing
+        // the previous conversation, and the next prefill would trust
+        // find_common_prefix_length() over cells that no longer exist:
+        // silently wrong attention, no crash, no log. So force the one state
+        // that is always consistent: empty cache, empty embd. Next prefill is
+        // then a full one, the fallback SessionRepository.restore expects.
+        //
+        // clear over seq_rm: the whole-cache restore path writes cells for
+        // every seq_id in the file, not just 0, so seq_rm(0, -1, -1) could
+        // leave foreign cells behind, and it can report failure on
+        // recurrent/hybrid models. data=false clears metadata only, the data
+        // buffers are unreachable once no cell refers to them (same choice
+        // rn-completion makes on its own cache-clear fallback).
+        //
+        // This also clears on failures that happened before the cache was
+        // touched (bad magic, truncated header): the public API returns a plain
+        // bool, so the two are indistinguishable without patching vendored
+        // llama-context.cpp. Cost is one extra prefill on a path where the
+        // session file is discarded anyway.
+        if (rnctx->completion != nullptr) {
+            rnctx->completion->embd.clear();
+            rnctx->completion->n_past = 0;
+        }
+        auto* mem = llama_get_memory(rnctx->ctx);
+        if (mem != nullptr) {
+            llama_memory_clear(mem, false);
+        }
+
+        LOGE("nativeLoadSession: llama_state_load_file failed, path=%s "
+             "(KV cache and completion state reset, next prefill will be full)",
+             spath.c_str());
         return -1;
     }
 
