@@ -15,6 +15,8 @@
  */
 
 #include <jni.h>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <android/log.h>
@@ -23,6 +25,7 @@
 #include "rn-completion.h"
 #include "rn-common.hpp"
 #include "common/common.h"
+#include "common/chat.h"
 #include "llama.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -114,6 +117,82 @@ static std::string utf8_take_complete(std::string& buf) {
     }
     buf.erase(0, tail_start);
     return out;
+}
+
+// Non-destructive variant of utf8_take_complete(), for text that is *not* a
+// stream tail we own: returns a copy stripped of any trailing incomplete
+// sequence (and of stray invalid bytes). Needed because the chat parser hands
+// back slices of the raw generated text, which during a partial parse can end
+// mid multi-byte character — NewStringUTF() aborts the VM on those.
+static std::string utf8_sanitized_copy(const std::string& s) {
+    std::string buf = s;
+    return utf8_take_complete(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Chat parse state (TEN-47)
+// ---------------------------------------------------------------------------
+// llama.cpp's chat layer already knows every reasoning convention there is
+// (<think>…</think>, gpt-oss/harmony <|channel|>…, Gemma…): applying a chat
+// template with common_chat_templates_apply() returns, besides the prompt, the
+// detected format plus a serialized PEG parser able to split the model's reply
+// into content / reasoning_content / tool_calls. rn-completion's
+// parseChatOutput() wraps that, but only works if beginCompletion() was handed
+// those three values first.
+//
+// nativeFormatChat() (which is where the template is applied) and
+// nativeCompletion() (which is where they're needed) are two separate JNI
+// calls, so the values have to survive in between. They can't live on the
+// completion object — rewind()/beginCompletion() own those fields — so they're
+// parked here, keyed by native context, and dropped in nativeFree().
+struct chat_parse_state {
+    // false when the prompt came from the legacy (non-jinja) fallback: no
+    // common_chat_params, hence no format and no parser. Parsing is then
+    // skipped entirely rather than run against a do-nothing parser, so the
+    // caller can tell "the engine has nothing to say about this reply" from
+    // "the engine says the reply is all content".
+    bool                    parsable = false;
+    int                     format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+    common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE;
+    // Assistant prefix the template appended. common_chat_peg_parse() expects
+    // it prepended to the model output, and the generated parser matches it.
+    std::string             generation_prompt;
+    // Serialized PEG arena (common_chat_params::parser). Empty for the
+    // non-PEG formats, where common_chat_parse() falls back to a pure-content
+    // parser on its own.
+    std::string             parser;
+    // The prompt this state describes. nativeCompletion() is free to be called
+    // with any string (see the raw `decode()` path in LlamaEngineFlow), so the
+    // state is only trusted when the prompt matches the one it came from —
+    // parsing an arbitrary completion with a chat template's parser would at
+    // best produce nonsense.
+    std::string             prompt;
+};
+
+static std::mutex                                   g_chat_state_mu;
+static std::map<const void*, chat_parse_state>      g_chat_state;
+
+static void chat_state_put(const void* key, chat_parse_state state) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    g_chat_state[key] = std::move(state);
+}
+
+static chat_parse_state chat_state_get(const void* key) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    auto it = g_chat_state.find(key);
+    return it == g_chat_state.end() ? chat_parse_state{} : it->second;
+}
+
+static void chat_state_erase(const void* key) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    g_chat_state.erase(key);
+}
+
+// No-op when no state is recorded for `key` (legacy template path).
+static void chat_state_set_prompt(const void* key, std::string prompt) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    auto it = g_chat_state.find(key);
+    if (it != g_chat_state.end()) it->second.prompt = std::move(prompt);
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +484,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
     if (h == 0L) return;
     auto* rnctx = to_ctx(h);
     LOGI("nativeFree ptr=%p", rnctx);
+    chat_state_erase(rnctx);
     delete rnctx;
 }
 
@@ -412,6 +492,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // nativeCompletion
 // ---------------------------------------------------------------------------
 // Kotlin interface attendue : interface TokenCallback { fun onToken(token: String) }
+// cbChat (nullable) : interface ChatParseCallback {
+//     fun onChatParse(content: String, reasoningContent: String) }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
@@ -425,7 +507,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jfloat  topP,
         jfloat  minP,
         jobjectArray stopSequences,
-        jobject cb)
+        jobject cb,
+        jobject cbChat)
 {
     if (h == 0L) return;
     auto* rnctx = to_ctx(h);
@@ -442,6 +525,19 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         LOGE("nativeCompletion: onToken method not found");
         env->DeleteLocalRef(cbClass);
         return;
+    }
+
+    jclass    chatCbClass = nullptr;
+    jmethodID onChatParse = nullptr;
+    if (cbChat != nullptr) {
+        chatCbClass = env->GetObjectClass(cbChat);
+        onChatParse = env->GetMethodID(chatCbClass, "onChatParse",
+                                       "(Ljava/lang/String;Ljava/lang/String;)V");
+        if (onChatParse == nullptr) {
+            LOGE("nativeCompletion: onChatParse method not found");
+            env->DeleteLocalRef(chatCbClass);
+            chatCbClass = nullptr;
+        }
     }
 
     // Set prompt, n_predict cap, and rewind completion state
@@ -478,14 +574,84 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     if (!comp->initSampling()) {
         LOGE("nativeCompletion: initSampling failed");
         env->DeleteLocalRef(cbClass);
+        if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
         return;
     }
 
     // Tokenise and load prompt (no media)
     comp->loadPrompt({});
 
-    // Begin generation
-    comp->beginCompletion();
+    // TEN-47: hand the chat format / reasoning format / generation prompt /
+    // PEG parser that nativeFormatChat() detected to the completion, which is
+    // what makes parseChatOutput() below able to split reasoning from content.
+    // Without them beginCompletion() defaults to CONTENT_ONLY + reasoning NONE
+    // and every reasoning marker the model emits stays in the content.
+    const chat_parse_state chat_state = chat_state_get(rnctx);
+    const bool chat_state_applies = chat_state.parsable
+                                 && chat_state.prompt == rnctx->params.prompt;
+    const bool parse_chat = chat_state_applies && onChatParse != nullptr;
+
+    if (chat_state_applies) {
+        comp->beginCompletion(chat_state.format, chat_state.reasoning_format,
+                              chat_state.generation_prompt, chat_state.parser);
+    } else {
+        // Raw (non-chat) completion, or a prompt this context never formatted:
+        // the pre-TEN-47 behaviour, everything is content.
+        comp->beginCompletion();
+    }
+
+    // Cumulative content / reasoning last handed to onChatParse — the callback
+    // is skipped when a token changes neither (the parser holds text back
+    // while a marker is still ambiguous), so the Kotlin side never sees a
+    // no-op update and never allocates a String for one.
+    std::string last_content;
+    std::string last_reasoning;
+    bool parse_failed_logged = false;
+
+    // Re-parses the whole reply so far. Deliberately: llama.cpp's chat parser
+    // is not incremental, and a partial parse can *retract* text (bytes that
+    // read as content become part of a marker once the next token lands), so
+    // there is no correct way to emit deltas from it without reimplementing
+    // the reconciliation. Cost measured off-device on the parser shape a
+    // tag-based reasoning template generates: ~6 µs per KB of accumulated
+    // reply, ~56 ms in total for a whole 2048-token generation parsed on every
+    // single token (x86; call it 3-5× that on a mid-range Cortex-A78, so a few
+    // hundred ms) — against a generation that takes minutes on the same core.
+    // Well under a percent of wall time, so no throttling: the alternative
+    // (parse every N tokens) would trade an always-correct stream for a
+    // saving that does not exist.
+    auto emit_parse = [&](bool is_partial) {
+        if (!parse_chat) return;
+        rnllama::completion_chat_output out;
+        try {
+            out = comp->parseChatOutput(is_partial);
+        } catch (const std::exception& e) {
+            // common_chat_parse() throws when the reply does not match the
+            // format the template advertised. Not fatal — the raw token
+            // stream is unaffected, the caller just gets no split for this
+            // reply and falls back to whatever it does without one.
+            if (!parse_failed_logged) {
+                LOGE("nativeCompletion: chat parse failed (%s) — reasoning split unavailable", e.what());
+                parse_failed_logged = true;
+            }
+            return;
+        }
+        if (out.content.empty() && out.reasoning_content.empty()) return;
+        if (out.content == last_content && out.reasoning_content == last_reasoning) return;
+        last_content   = out.content;
+        last_reasoning = out.reasoning_content;
+
+        // Both can end mid multi-byte character on a partial parse.
+        const std::string safe_content   = utf8_sanitized_copy(last_content);
+        const std::string safe_reasoning = utf8_sanitized_copy(last_reasoning);
+        jstring jcontent   = env->NewStringUTF(safe_content.c_str());
+        jstring jreasoning = env->NewStringUTF(safe_reasoning.c_str());
+        if (jcontent != nullptr && jreasoning != nullptr) {
+            env->CallVoidMethod(cbChat, onChatParse, jcontent, jreasoning);
+        }
+        if (jcontent   != nullptr) env->DeleteLocalRef(jcontent);
+        if (jreasoning != nullptr) env->DeleteLocalRef(jreasoning);
+    };
 
     // UTF-8 holdback buffer: only complete sequences ever reach NewStringUTF.
     std::string utf8_buf;
@@ -505,6 +671,11 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     // is dropped so the stream never contains the stop sequence.
     std::string pending;
 
+    // Offset in generated_text where a matched stop word starts, so the final
+    // parse can be run on the reply without it (findStoppingStrings() does not
+    // truncate generated_text itself).
+    size_t stop_trim_pos = std::string::npos;
+
     while (comp->has_next_token && !comp->is_interrupted) {
         rnllama::completion_token_output tok_out = comp->doCompletion();
 
@@ -516,6 +687,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
 
         if (!has_stops) {
             emit(text);
+            emit_parse(/* is_partial */ true);
             continue;
         }
 
@@ -530,6 +702,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
                 emit(pending.substr(0, pending.size() - tail_after_stop));
             }
             pending.clear();
+            stop_trim_pos = stop_pos;
             break;  // has_next_token was set false by findStoppingStrings
         }
 
@@ -542,6 +715,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
             emit(pending.substr(0, partial_pos));
             pending.erase(0, partial_pos);
         }
+        emit_parse(/* is_partial */ true);
     }
 
     // Generation ended without a stop match (EOS / n_predict / interrupt):
@@ -551,7 +725,21 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         emit(pending);
     }
 
+    // Final, non-partial parse: the partial parser is lenient (it has to
+    // tolerate a marker arriving half-written) where the full one resolves the
+    // reply for good. Dropping the stop word first, so it doesn't land in
+    // `content` — the token stream never contained it either.
+    if (parse_chat) {
+        if (stop_trim_pos != std::string::npos && stop_trim_pos <= comp->generated_text.size()) {
+            comp->generated_text.erase(stop_trim_pos);
+        }
+        // An interrupted reply is by definition unfinished — parsing it as
+        // complete would only throw on a marker the model never got to close.
+        emit_parse(/* is_partial */ comp->is_interrupted);
+    }
+
     env->DeleteLocalRef(cbClass);
+    if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +769,16 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
         // render an empty think block / no think prompt when disabled).
         // Empty chat_template → template stored in the GGUF (rnctx->templates).
         // add_generation_prompt = true appends the assistant prefix.
-        formatted = rnctx->getFormattedChatWithJinja(
+        //
+        // reasoning_format is "auto", not "none": it is not just a post-hoc
+        // display setting, it is baked into the parser generated here.
+        // common_chat_templates_apply() → autoparser::build_parser() only wires
+        // a reasoning rule when reasoning_format != NONE (see
+        // chat-auto-parser-generator.cpp), so asking for "none" hands back a
+        // parser that can only ever report everything — reasoning markers
+        // included — as content. That was TEN-47: Gemma/gpt-oss channel
+        // markers rendered raw in the chat.
+        const common_chat_params params = rnctx->getFormattedChatWithJinja(
             msgs,
             /* chat_template     */ "",
             /* json_schema       */ "",
@@ -589,16 +786,40 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
             /* parallel_tool_call*/ false,
             /* tool_choice       */ "",
             /* enable_thinking   */ enableThinking == JNI_TRUE,
-            /* reasoning_format  */ "none",  // "" throws (Unknown reasoning format); none = raw passthrough
+            /* reasoning_format  */ "auto",  // "" throws (Unknown reasoning format)
             /* add_generation_prompt */ true,
             /* now_str           */ "",
             /* chat_template_kwargs */ {},
             /* force_pure_content*/ false
-        ).prompt;
+        );
+        formatted = params.prompt;
+
+        chat_parse_state state;
+        state.parsable          = true;
+        state.format            = static_cast<int>(params.format);
+        state.reasoning_format  = COMMON_REASONING_FORMAT_AUTO;
+        state.generation_prompt = params.generation_prompt;
+        state.parser            = params.parser;
+        // state.prompt is filled in below, from the round-tripped string.
+        chat_state_put(rnctx, std::move(state));
+
+        // Own try: common_chat_format_name() throws on a format it doesn't
+        // know, and a llama.cpp bump adding one must not make a *log line* the
+        // thing that silently drops every chat onto the legacy template path.
+        const char* format_name = "unknown";
+        try {
+            format_name = common_chat_format_name(params.format);
+        } catch (const std::exception&) { /* keep "unknown" */ }
+        LOGI("nativeFormatChat: chat format=%s, parser=%zu bytes, generation_prompt=%zu chars",
+             format_name, params.parser.size(), params.generation_prompt.size());
     } catch (const std::exception& e) {
         // Some templates fail under jinja — fall back to the legacy path
         // (no thinking control there).
         LOGE("nativeFormatChat: jinja failed (%s), falling back to legacy", e.what());
+        // No common_chat_params on that path, so nothing to parse the reply
+        // with: drop any state a previous call left behind rather than apply a
+        // stale parser to this prompt's output.
+        chat_state_erase(rnctx);
         try {
             formatted = rnctx->getFormattedChat(msgs, "");
         } catch (const std::exception& e2) {
@@ -608,7 +829,17 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
     }
 
     LOGI("nativeFormatChat: formatted %zu chars (thinking=%d)", formatted.size(), enableThinking);
-    return env->NewStringUTF(formatted.c_str());
+
+    jstring jformatted = env->NewStringUTF(formatted.c_str());
+    // Record the prompt as nativeCompletion will actually see it, not as it was
+    // built here: JNI's modified UTF-8 is not the identity round-trip on
+    // characters outside the BMP (an emoji in the user's message comes back as
+    // a 6-byte CESU-8 surrogate pair, not the 4-byte UTF-8 it went in as), and
+    // the equality check that gates chat parsing would then fail — silently
+    // disabling the reasoning split for exactly the conversations that contain
+    // one.
+    chat_state_set_prompt(rnctx, jstring_to_std(env, jformatted));
+    return jformatted;
 }
 
 // ---------------------------------------------------------------------------

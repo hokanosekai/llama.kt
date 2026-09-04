@@ -109,9 +109,13 @@ class LlamaEngine {
     fun load(path: String, nGpuLayers: Int = 0, nCtx: Int = 4096, nThreads: Int = 0,
              onProgress: LoadProgressCallback? = null, kvCacheType: String? = null,
              flashAttn: String? = null)
-    fun completion(prompt: String, params: SamplingParams = SamplingParams(), callback: TokenCallback)
+    // chatParseCallback (optional, best-effort): reply already split into answer/reasoning by
+    // llama.cpp's own chat parser — only fires when `prompt` came from formatChat() below
+    fun completion(prompt: String, params: SamplingParams = SamplingParams(), callback: TokenCallback,
+                   chatParseCallback: ChatParseCallback? = null)
     // enableThinking=false renders thinking models (Qwen3…) with reasoning disabled:
     // measured 512 tokens / 106s -> 18 tokens / 7s on the same arithmetic prompt
+    // Also records the chat format + parser llama.cpp derived from the template, for the above.
     fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String
     fun tokenize(text: String): IntArray
     fun kvUsed(): Int                 // KV cache cells used = context budget
@@ -153,6 +157,13 @@ data class SamplingParams(
 data class ChatMessage(val role: String, val content: String)
 data class BackendInfo(val name: String, val description: String, val type: String)
 fun interface TokenCallback { fun onToken(token: String) }
+
+// Cumulative (not deltas), fires at most once per sampled token. Covers every reasoning
+// convention the model's chat template can express — <think>…</think>, gpt-oss/harmony
+// <|channel|>…, Gemma's — because the parser is generated from that template, not hardcoded.
+// Never fires for a raw completion, for a template jinja could not render, or for a reply
+// that does not match the format its template advertised: always keep a fallback.
+fun interface ChatParseCallback { fun onChatParse(content: String, reasoningContent: String) }
 
 // extensions (Flow)
 fun LlamaEngine.chat(messages: List<ChatMessage>, params: SamplingParams = SamplingParams(),

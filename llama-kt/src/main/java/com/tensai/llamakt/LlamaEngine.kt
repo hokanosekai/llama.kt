@@ -194,6 +194,10 @@ class LlamaEngine {
      *   false renders the template with thinking disabled: faster first
      *   visible token, at some quality cost on hard prompts. No effect on
      *   models without a thinking template.
+     *
+     * Also records, for this engine, the chat format and parser llama.cpp
+     * derived from the template — that is what lets [completion] fill a
+     * [ChatParseCallback] when handed back this exact prompt.
      */
     fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String {
         val arr = JSONArray()
@@ -211,16 +215,23 @@ class LlamaEngine {
      * [params] controls generation length and sampling (see [SamplingParams]).
      * This is a blocking call — run it from a background thread or
      * use the [decode] Flow extension which handles that automatically.
+     *
+     * [chatParseCallback] — optional, and only useful when [prompt] came from
+     *   [formatChat]: streams the same reply already split into answer and
+     *   reasoning by llama.cpp's chat parser. See [ChatParseCallback] for when
+     *   it does *not* fire (it is best-effort, and callers need a fallback).
      */
     fun completion(
         prompt: String,
         params: SamplingParams = SamplingParams(),
         callback: TokenCallback,
+        chatParseCallback: ChatParseCallback? = null,
     ) = nativeCompletion(
         handle, prompt,
         params.nPredict, params.temperature, params.topK, params.topP, params.minP,
         params.stopSequences.toTypedArray(),
         callback,
+        chatParseCallback,
     )
 
     // ------------------------------------------------------------------
@@ -239,6 +250,7 @@ class LlamaEngine {
         nPredict: Int, temperature: Float, topK: Int, topP: Float, minP: Float,
         stopSequences: Array<String>,
         cb: TokenCallback,
+        cbChat: ChatParseCallback?,
     )
     private external fun nativeFormatChat(h: Long, messagesJson: String, enableThinking: Boolean): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
