@@ -15,6 +15,7 @@
  */
 
 #include <jni.h>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <string>
@@ -282,7 +283,10 @@ Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
 // nativeReadGgufMetadata  (static — reads the GGUF header only, no weights)
 // ---------------------------------------------------------------------------
 // Returns a JSON string with architecture, name, file_type, context_length,
-// embedding_length, block_count, param_count, vocab_size, file_size_bytes.
+// embedding_length, block_count, param_count, vocab_size, file_size_bytes,
+// plus the attention/KV-cache shape (head_count, head_count_kv,
+// kv_full_elements_per_token, kv_swa_elements_per_token, sliding_window) —
+// see the "KV-cache shape" block below for how those last three are derived.
 // no_alloc=true → only the key-value header and tensor infos are read; a
 // multi-GB model is inspected in milliseconds. Returns nullptr on failure.
 
@@ -320,6 +324,61 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         }
     };
 
+    // Some attention keys are per-layer arrays rather than scalars (Gemma 4's
+    // attention.head_count_kv is [8, 8, 8, 8, 8, 2, …] — see llama-model.cpp's
+    // get_key_or_arr for head_count/head_count_kv). Fills all `n` entries of
+    // `out`: a scalar is broadcast, an array of exactly `n` entries is copied.
+    // Returns false when the key is missing, is an array of some other length,
+    // or holds anything that isn't a plain unsigned count — callers must then
+    // keep their own default rather than act on a value that isn't the one
+    // llama.cpp would use, and must not read `out`, which a rejected array may
+    // have partially written.
+    auto get_uint_per_layer = [&](const std::string& key, std::vector<uint64_t>& out, size_t n) -> bool {
+        int64_t i = lm_gguf_find_key(gctx, key.c_str());
+        if (i < 0) return false;
+
+        const enum lm_gguf_type kv_type = lm_gguf_get_kv_type(gctx, i);
+        if (kv_type != LM_GGUF_TYPE_ARRAY) {
+            const uint64_t scalar = get_uint(key);
+            if (scalar == 0) return false;
+            std::fill(out.begin(), out.begin() + n, scalar);
+            return true;
+        }
+
+        if (lm_gguf_get_arr_n(gctx, i) != n) return false;
+
+        const void* data = lm_gguf_get_arr_data(gctx, i);
+        switch (lm_gguf_get_arr_type(gctx, i)) {
+            case LM_GGUF_TYPE_UINT32:
+                for (size_t il = 0; il < n; il++) out[il] = static_cast<const uint32_t*>(data)[il];
+                return true;
+            case LM_GGUF_TYPE_INT32:
+                for (size_t il = 0; il < n; il++) {
+                    const int32_t v = static_cast<const int32_t*>(data)[il];
+                    if (v < 0) return false;
+                    out[il] = static_cast<uint64_t>(v);
+                }
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    // Bool arrays are stored as int8 (see gguf.h). Same all-or-nothing contract
+    // as get_uint_per_layer: a length mismatch or any other type reads as "not
+    // available" rather than as a partial answer.
+    auto get_bool_per_layer = [&](const std::string& key, std::vector<uint8_t>& out, size_t n) -> bool {
+        int64_t i = lm_gguf_find_key(gctx, key.c_str());
+        if (i < 0) return false;
+        if (lm_gguf_get_kv_type(gctx, i) != LM_GGUF_TYPE_ARRAY) return false;
+        if (lm_gguf_get_arr_type(gctx, i) != LM_GGUF_TYPE_BOOL) return false;
+        if (lm_gguf_get_arr_n(gctx, i) != n) return false;
+
+        const auto* data = static_cast<const int8_t*>(lm_gguf_get_arr_data(gctx, i));
+        for (size_t il = 0; il < n; il++) out[il] = data[il] != 0 ? 1 : 0;
+        return true;
+    };
+
     const std::string arch = get_str("general.architecture");
 
     // Parameter count: sum of elements over all tensor infos
@@ -348,6 +407,110 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
                          || tmpl.find("<think>") != std::string::npos;
     }
 
+    const uint64_t n_layer = get_uint(arch + ".block_count");
+    const uint64_t n_embd  = get_uint(arch + ".embedding_length");
+
+    // -----------------------------------------------------------------
+    // KV-cache shape
+    //
+    // llama_kv_cache allocates, per layer that owns a cache, a K tensor of
+    // n_embd_k_gqa(il) * kv_size elements and a V tensor of n_embd_v_gqa(il) *
+    // kv_size, where n_embd_k_gqa(il) = n_embd_head_k(il) * n_head_kv(il)
+    // (llama-hparams.cpp). Summing that over the layers gives the elements per
+    // context token — the number a caller needs to size a load, and one that
+    // n_embd * n_layer only matches for plain multi-head attention.
+    //
+    // Two buckets, because llama_kv_cache_iswa allocates two caches: the
+    // full-attention layers at kv_size = n_ctx, and the sliding-window layers
+    // at kv_size = min(n_ctx, sliding_window + one ubatch) instead. Callers
+    // that don't care can just add the two and treat both as growing with
+    // n_ctx — that over-estimates, which is the safe direction.
+    //
+    // Every read here fails closed: a key that is missing, the wrong type or
+    // the wrong length leaves the layer in the full-attention bucket at the
+    // larger of its two head dimensions, and a model whose head counts can't
+    // be read at all reports 0 so the caller knows to fall back to its own
+    // estimate. Over-estimating a KV cache costs context; under-estimating it
+    // costs an out-of-memory kill at load time.
+    // -----------------------------------------------------------------
+    uint64_t kv_full_elements = 0;  // elements per token in layers sized by n_ctx
+    uint64_t kv_swa_elements  = 0;  // elements per token in sliding-window layers
+    uint64_t sliding_window   = 0;  // 0 unless kv_swa_elements > 0
+    uint64_t head_count       = 0;
+    uint64_t head_count_kv    = 0;
+
+    if (n_layer > 0 && n_embd > 0) {
+        std::vector<uint64_t> n_head   (n_layer, 0);
+        std::vector<uint64_t> n_head_kv(n_layer, 0);
+
+        const bool have_head    = get_uint_per_layer(arch + ".attention.head_count",    n_head,    n_layer);
+        const bool have_head_kv = get_uint_per_layer(arch + ".attention.head_count_kv", n_head_kv, n_layer);
+
+        if (have_head && have_head_kv) {
+            head_count    = *std::max_element(n_head.begin(),    n_head.end());
+            head_count_kv = *std::max_element(n_head_kv.begin(), n_head_kv.end());
+
+            // llama.cpp defaults the head dimensions to n_embd / n_head() —
+            // n_head() being layer 0's head count — and overrides them with
+            // attention.key_length / .value_length when those are present.
+            const uint64_t head_dim_default = n_head[0] > 0 ? n_embd / n_head[0] : 0;
+
+            uint64_t k_full = get_uint(arch + ".attention.key_length");
+            uint64_t v_full = get_uint(arch + ".attention.value_length");
+            if (k_full == 0) k_full = head_dim_default;
+            if (v_full == 0) v_full = head_dim_default;
+
+            uint64_t k_swa = get_uint(arch + ".attention.key_length_swa");
+            uint64_t v_swa = get_uint(arch + ".attention.value_length_swa");
+            if (k_swa == 0) k_swa = k_full;
+            if (v_swa == 0) v_swa = v_full;
+
+            // Layers from this index on reuse an earlier layer's cache rather
+            // than owning one (llama_hparams::has_kv, driven by the
+            // layer_reuse_cb in llama-model.cpp). Only honoured for the
+            // architectures whose loader in this tree actually reads
+            // attention.shared_kv_layers — see models/gemma4.cpp. Every other
+            // architecture keeps all n_layer caches, even if it happens to
+            // carry the key.
+            uint64_t n_layer_kv = n_layer;
+            if (arch == "gemma4" || arch == "gemma4-assistant") {
+                const uint64_t shared = get_uint(arch + ".attention.shared_kv_layers");
+                if (shared < n_layer) n_layer_kv = n_layer - shared;
+            }
+
+            // Which layers are windowed, taken only from an explicit per-layer
+            // bool array of exactly n_layer entries, and only for the
+            // architectures that feed that array straight into
+            // hparams.is_swa_impl (models/gemma4.cpp again). The key's scalar
+            // form is a *period* whose phase varies per architecture
+            // (llama_hparams::set_swa_pattern's dense_first), so it is
+            // deliberately not interpreted: reading it wrong would mark a
+            // full-attention layer as windowed and under-estimate the cache.
+            std::vector<uint8_t> is_swa(n_layer, 0);
+            const uint64_t n_swa = get_uint(arch + ".attention.sliding_window");
+            const bool have_swa = n_swa > 0
+                && (arch == "gemma4" || arch == "gemma4-assistant")
+                && get_bool_per_layer(arch + ".attention.sliding_window_pattern", is_swa, n_layer);
+
+            if (!have_swa) {
+                // No idea which layers are windowed, so every layer is charged
+                // at whichever of the two head dimensions is larger.
+                k_full = std::max(k_full, k_swa);
+                v_full = std::max(v_full, v_swa);
+            }
+
+            for (uint64_t il = 0; il < n_layer_kv; il++) {
+                if (have_swa && is_swa[il]) {
+                    kv_swa_elements += n_head_kv[il] * (k_swa + v_swa);
+                } else {
+                    kv_full_elements += n_head_kv[il] * (k_full + v_full);
+                }
+            }
+
+            if (kv_swa_elements > 0) sliding_window = n_swa;
+        }
+    }
+
     struct stat st{};
     const uint64_t file_size = (stat(fpath.c_str(), &st) == 0)
         ? static_cast<uint64_t>(st.st_size) : 0;
@@ -357,12 +520,17 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         {"name",             get_str("general.name")},
         {"file_type",        get_uint("general.file_type")},
         {"context_length",   get_uint(arch + ".context_length")},
-        {"embedding_length", get_uint(arch + ".embedding_length")},
-        {"block_count",      get_uint(arch + ".block_count")},
+        {"embedding_length", n_embd},
+        {"block_count",      n_layer},
         {"param_count",      n_params},
         {"vocab_size",       vocab},
         {"file_size_bytes",  file_size},
         {"supports_thinking", supports_thinking},
+        {"head_count",              head_count},
+        {"head_count_kv",           head_count_kv},
+        {"kv_full_elements_per_token", kv_full_elements},
+        {"kv_swa_elements_per_token",  kv_swa_elements},
+        {"sliding_window",             sliding_window},
     };
 
     lm_gguf_free(gctx);

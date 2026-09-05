@@ -61,6 +61,23 @@ fun interface LoadProgressCallback {
  * [paramCount] is computed from the tensor infos (sum of elements), so it is
  * the real total — including e.g. per-layer embeddings on Gemma 3n.
  * [quantLabel] is a human-readable name for [fileType] ("Q4_K_M", …).
+ *
+ * @param headCount largest attention head count over the layers (the key can
+ *   be a per-layer array). 0 when the model has no attention heads or the key
+ *   is unreadable.
+ * @param headCountKv largest KV head count over the layers — below [headCount]
+ *   on a grouped-query model. Same 0-means-unknown rule.
+ * @param kvFullElementsPerToken K+V cache elements one context token occupies
+ *   across the layers whose cache is sized by `n_ctx`. **0 means the shape
+ *   could not be read** — callers must fall back to their own estimate rather
+ *   than treating it as "no cache".
+ * @param kvSwaElementsPerToken same, for the sliding-window layers, whose
+ *   cache is capped at [slidingWindow] (plus one ubatch) instead of growing
+ *   with `n_ctx`. 0 when the model has none, or when which layers are windowed
+ *   could not be established — in that case those layers are already counted
+ *   in [kvFullElementsPerToken], which over-estimates rather than under-.
+ * @param slidingWindow window size in tokens, 0 unless
+ *   [kvSwaElementsPerToken] is non-zero.
  */
 data class GgufMetadata(
     val architecture: String,
@@ -75,6 +92,11 @@ data class GgufMetadata(
     val fileSizeBytes: Long,
     /** Detected from the chat template (enable_thinking / <think> markers). */
     val supportsThinking: Boolean,
+    val headCount: Long = 0,
+    val headCountKv: Long = 0,
+    val kvFullElementsPerToken: Long = 0,
+    val kvSwaElementsPerToken: Long = 0,
+    val slidingWindow: Long = 0,
 )
 
 class LlamaEngine {
@@ -295,6 +317,11 @@ class LlamaEngine {
                     vocabSize       = obj.optLong("vocab_size", 0),
                     fileSizeBytes   = obj.optLong("file_size_bytes", 0),
                     supportsThinking = obj.optBoolean("supports_thinking", false),
+                    headCount       = obj.optLong("head_count", 0),
+                    headCountKv     = obj.optLong("head_count_kv", 0),
+                    kvFullElementsPerToken = obj.optLong("kv_full_elements_per_token", 0),
+                    kvSwaElementsPerToken  = obj.optLong("kv_swa_elements_per_token", 0),
+                    slidingWindow          = obj.optLong("sliding_window", 0),
                 )
             } catch (_: Exception) { null }
         }
