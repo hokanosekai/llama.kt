@@ -78,6 +78,10 @@ fun interface LoadProgressCallback {
  *   in [kvFullElementsPerToken], which over-estimates rather than under-.
  * @param slidingWindow window size in tokens, 0 unless
  *   [kvSwaElementsPerToken] is non-zero.
+ * @param kvShapeVersion which revision of the native derivation produced the
+ *   three fields above — see [LlamaEngine.kvShapeVersion]. Persist it
+ *   alongside them if you persist them at all; 0 only ever comes from a
+ *   library too old to report one.
  */
 data class GgufMetadata(
     val architecture: String,
@@ -97,6 +101,7 @@ data class GgufMetadata(
     val kvFullElementsPerToken: Long = 0,
     val kvSwaElementsPerToken: Long = 0,
     val slidingWindow: Long = 0,
+    val kvShapeVersion: Long = 0,
 )
 
 class LlamaEngine {
@@ -322,12 +327,33 @@ class LlamaEngine {
                     kvFullElementsPerToken = obj.optLong("kv_full_elements_per_token", 0),
                     kvSwaElementsPerToken  = obj.optLong("kv_swa_elements_per_token", 0),
                     slidingWindow          = obj.optLong("sliding_window", 0),
+                    kvShapeVersion         = obj.optLong("kv_shape_version", 0),
                 )
             } catch (_: Exception) { null }
         }
 
         @JvmStatic
         private external fun nativeReadGgufMetadata(path: String): String?
+
+        /**
+         * Which revision of the native KV-shape derivation this build carries
+         * — the same number [readMetadata] stamps into
+         * [GgufMetadata.kvShapeVersion], but answerable without a file.
+         *
+         * For callers that persist a model's KV shape: store this alongside
+         * it, and re-read whatever was stored under a *different* number. The
+         * comparison is equality, not ordering — the derivation is versioned
+         * so a change can be detected, and a change that lowers a number
+         * matters as much as one that raises it. Treat a version you don't
+         * recognise as a difference, not as an error.
+         *
+         * Defined in `tensai_jni.cpp` next to the derivation itself, so it
+         * cannot drift from the formula it describes.
+         */
+        fun kvShapeVersion(): Long = nativeKvShapeVersion()
+
+        @JvmStatic
+        private external fun nativeKvShapeVersion(): Long
 
         /**
          * Count the "big" cores of a big.LITTLE SoC: cores whose

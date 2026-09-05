@@ -5,7 +5,8 @@
  *   nativeLoadModel, nativeFree, nativeCompletion,
  *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
  *   nativeInterrupt, nativeSaveSession, nativeLoadSession,
- *   nativeListBackends, nativeActiveBackend
+ *   nativeListBackends, nativeActiveBackend,
+ *   nativeReadGgufMetadata, nativeKvShapeVersion
  *
  * KV used-cells strategy: this version of llama.cpp (b9769) exposes no
  * public llama_kv_self_used_cells() or llama_kv_self_n_tokens(). The
@@ -36,6 +37,37 @@
 #define LOG_TAG "TensaiJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// KV-cache shape derivation version
+// ---------------------------------------------------------------------------
+// Stamped onto every kv_full_elements_per_token / kv_swa_elements_per_token /
+// sliding_window triple this file derives (see the "KV-cache shape" block in
+// nativeReadGgufMetadata), and readable on its own through
+// nativeKvShapeVersion() without a file to read.
+//
+// It exists so a caller that *persists* those numbers can tell which
+// derivation produced the ones it already has. The formula lives here, so this
+// file is the only thing that knows when it changed — a version constant on
+// the Kotlin or app side would be a number somebody has to remember to bump
+// while editing C++ in a submodule, and forgetting once means the stale
+// numbers are never noticed.
+//
+// **Bump this whenever the derivation below changes in a way that can move a
+// number**, including a fix that only affects some architectures. Callers are
+// expected to compare, not to interpret: any difference means "re-read", so an
+// unrecognised (e.g. newer) version must stay a normal case for them.
+//
+//   1 — first derivation (per-layer n_head_kv * head dim, both halves).
+//   2 — the V half charged at n_embd_v_gqa_max() for every layer, which is
+//       what llama.cpp allocates whenever the V cache is transposed, i.e.
+//       whenever flash attention is off. Version 1 under-counted every model
+//       whose KV head count varies per layer.
+//
+// Versions 1 and 2 both shipped before this constant existed, so neither was
+// ever reported; a caller holding numbers with no version recorded cannot
+// tell which of the two it has and must re-read.
+#define TENSAI_KV_SHAPE_VERSION 2
 
 // ---------------------------------------------------------------------------
 // Log redirection — llama.cpp/ggml log to stderr by default, which is lost on
@@ -555,6 +587,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         {"kv_full_elements_per_token", kv_full_elements},
         {"kv_swa_elements_per_token",  kv_swa_elements},
         {"sliding_window",             sliding_window},
+        {"kv_shape_version",           TENSAI_KV_SHAPE_VERSION},
     };
 
     lm_gguf_free(gctx);
@@ -562,6 +595,22 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
     const std::string out = j.dump();
     LOGI("nativeReadGgufMetadata: %s", out.c_str());
     return env->NewStringUTF(out.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// nativeKvShapeVersion  (static — no model, no file)
+// ---------------------------------------------------------------------------
+// The same TENSAI_KV_SHAPE_VERSION that nativeReadGgufMetadata stamps into
+// every result, answerable without a GGUF to read. A caller holding persisted
+// KV shapes needs it to decide *which* of them are stale before it opens
+// anything — see the constant's comment at the top of this file.
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeKvShapeVersion(
+        JNIEnv* /* env */,
+        jclass /* clazz */)
+{
+    return static_cast<jlong>(TENSAI_KV_SHAPE_VERSION);
 }
 
 // ---------------------------------------------------------------------------
