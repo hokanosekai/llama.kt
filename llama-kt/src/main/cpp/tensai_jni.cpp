@@ -420,11 +420,25 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
     // context token — the number a caller needs to size a load, and one that
     // n_embd * n_layer only matches for plain multi-head attention.
     //
+    // The V half is the exception: at [TAG_V_CACHE_VARIABLE] in
+    // llama-kv-cache.cpp the per-layer n_embd_v_gqa(il) is only used when the
+    // V cache is untransposed, and v_trans = !cparams.flash_attn
+    // (llama-model.cpp). Without flash attention every layer's V tensor is
+    // sized at n_embd_v_gqa_max(), the largest any layer needs. Flash
+    // attention is left on AUTO by the load path, so which of the two a load
+    // lands on isn't knowable here — the V half is charged at the max for
+    // every layer, which is the conservative side of that unknown and exact
+    // whenever the head counts don't vary per layer anyway.
+    //
     // Two buckets, because llama_kv_cache_iswa allocates two caches: the
     // full-attention layers at kv_size = n_ctx, and the sliding-window layers
-    // at kv_size = min(n_ctx, sliding_window + one ubatch) instead. Callers
-    // that don't care can just add the two and treat both as growing with
-    // n_ctx — that over-estimates, which is the safe direction.
+    // at kv_size = pad256(min(n_ctx, sliding_window + one ubatch)) instead.
+    // Both kv_size values are whole multiples of 256 cells — llama_context
+    // pads n_ctx itself before any cache is built — so a caller multiplying
+    // these counts by a raw n_ctx under-estimates unless it pads first.
+    // Callers that don't care about the second bucket can just add the two and
+    // treat both as growing with n_ctx — that over-estimates, which is the
+    // safe direction.
     //
     // Every read here fails closed: a key that is missing, the wrong type or
     // the wrong length leaves the layer in the full-attention bucket at the
@@ -499,11 +513,21 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
                 v_full = std::max(v_full, v_swa);
             }
 
+            // n_embd_v_gqa_max(): the largest V row any layer needs, which is
+            // what every layer gets charged when v_trans (see this block's
+            // header). Taken over all n_layer entries, not just the
+            // cache-owning ones, matching llama_hparams' own loop.
+            uint64_t v_gqa_max = 0;
+            for (uint64_t il = 0; il < n_layer; il++) {
+                const uint64_t v_len = (have_swa && is_swa[il]) ? v_swa : v_full;
+                v_gqa_max = std::max(v_gqa_max, n_head_kv[il] * v_len);
+            }
+
             for (uint64_t il = 0; il < n_layer_kv; il++) {
                 if (have_swa && is_swa[il]) {
-                    kv_swa_elements += n_head_kv[il] * (k_swa + v_swa);
+                    kv_swa_elements += n_head_kv[il] * k_swa + v_gqa_max;
                 } else {
-                    kv_full_elements += n_head_kv[il] * (k_full + v_full);
+                    kv_full_elements += n_head_kv[il] * k_full + v_gqa_max;
                 }
             }
 
