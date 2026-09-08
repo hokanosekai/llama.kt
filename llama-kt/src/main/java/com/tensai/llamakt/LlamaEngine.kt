@@ -21,6 +21,14 @@ data class ChatMessage(val role: String, val content: String)
  * [stopSequences] — strings that end generation when they appear in the
  *   output. The matched sequence is not emitted (partial matches are held
  *   back until resolved), so the stream stays clean.
+ * [reasoningBudgetTokens] — cap on the tokens a thinking model may spend
+ *   *inside* its reasoning block, `-1` (the default) for no cap. Reaching it
+ *   does not end the generation: llama.cpp forces the model out of the block
+ *   by emitting the template's own closing tag, and the model then writes its
+ *   answer into what [nPredict] has left. Only applies to a [prompt] that came
+ *   from [LlamaEngine.formatChat] and to a model whose chat template delimits
+ *   reasoning — it is silently ignored otherwise, since there is no tag to
+ *   force. Independent of [nPredict], which still caps the decode as a whole.
  *
  * Defaults match llama.cpp's common_params_sampling.
  */
@@ -31,6 +39,7 @@ data class SamplingParams(
     val topP: Float = 0.95f,
     val minP: Float = 0.05f,
     val stopSequences: List<String> = emptyList(),
+    val reasoningBudgetTokens: Int = -1,
 )
 
 /**
@@ -255,7 +264,8 @@ class LlamaEngine {
         chatParseCallback: ChatParseCallback? = null,
     ) = nativeCompletion(
         handle, prompt,
-        params.nPredict, params.temperature, params.topK, params.topP, params.minP,
+        params.nPredict, params.reasoningBudgetTokens,
+        params.temperature, params.topK, params.topP, params.minP,
         params.stopSequences.toTypedArray(),
         callback,
         chatParseCallback,
@@ -274,7 +284,8 @@ class LlamaEngine {
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
         h: Long, prompt: String,
-        nPredict: Int, temperature: Float, topK: Int, topP: Float, minP: Float,
+        nPredict: Int, reasoningBudgetTokens: Int,
+        temperature: Float, topK: Int, topP: Float, minP: Float,
         stopSequences: Array<String>,
         cb: TokenCallback,
         cbChat: ChatParseCallback?,
