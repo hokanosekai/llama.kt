@@ -59,15 +59,22 @@
 // unrecognised (e.g. newer) version must stay a normal case for them.
 //
 //   1 — first derivation (per-layer n_head_kv * head dim, both halves).
-//   2 — the V half charged at n_embd_v_gqa_max() for every layer, which is
-//       what llama.cpp allocates whenever the V cache is transposed, i.e.
-//       whenever flash attention is off. Version 1 under-counted every model
-//       whose KV head count varies per layer.
+//   2 — the V half charged at n_embd_v_gqa_max() for every layer, on the
+//       belief that llama.cpp transposes the V cache whenever flash attention
+//       is off. It does, but the cache is built before the AUTO setting is
+//       resolved, so the load path this file serves never lands there — see
+//       version 3.
+//   3 — the V half charged back at the layer's own n_embd_v_gqa(il), and
+//       gemma3n's twenty cache-owning layers honoured the way gemma4's
+//       already were. Version 2 over-counted the windowed half of every
+//       model with a smaller SWA head dimension than its full-attention one
+//       (Gemma 4: 9216 elements/token instead of 6144), and versions 1 and 2
+//       both charged gemma3n for all of its blocks instead of the first 20.
 //
 // Versions 1 and 2 both shipped before this constant existed, so neither was
 // ever reported; a caller holding numbers with no version recorded cannot
 // tell which of the two it has and must re-read.
-#define TENSAI_KV_SHAPE_VERSION 2
+#define TENSAI_KV_SHAPE_VERSION 3
 
 // ---------------------------------------------------------------------------
 // Log redirection — llama.cpp/ggml log to stderr by default, which is lost on
@@ -460,15 +467,22 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
     // context token — the number a caller needs to size a load, and one that
     // n_embd * n_layer only matches for plain multi-head attention.
     //
-    // The V half is the exception: at [TAG_V_CACHE_VARIABLE] in
-    // llama-kv-cache.cpp the per-layer n_embd_v_gqa(il) is only used when the
-    // V cache is untransposed, and v_trans = !cparams.flash_attn
-    // (llama-model.cpp). Without flash attention every layer's V tensor is
-    // sized at n_embd_v_gqa_max(), the largest any layer needs. Flash
-    // attention is left on AUTO by the load path, so which of the two a load
-    // lands on isn't knowable here — the V half is charged at the max for
-    // every layer, which is the conservative side of that unknown and exact
-    // whenever the head counts don't vary per layer anyway.
+    // The V half looks like an exception and isn't: at [TAG_V_CACHE_VARIABLE]
+    // in llama-kv-cache.cpp a layer's V tensor is sized at n_embd_v_gqa_max(),
+    // the largest any layer needs, rather than at its own n_embd_v_gqa(il)
+    // whenever v_trans, and v_trans = !cparams.flash_attn (llama-model.cpp).
+    // But cparams.flash_attn is still just `flash_attn_type != DISABLED` at
+    // that point: llama_context's constructor calls create_memory() well
+    // before the `if (cparams.auto_fa)` block that turns AUTO into a real
+    // answer, and never rebuilds the cache afterwards. So AUTO and ENABLED
+    // both build it with v_trans = false, and only an explicit "off" gets the
+    // padding. The load path leaves the type on AUTO unless a caller says
+    // otherwise, and an "off" caller cannot ask for a quantised V cache at all
+    // (llama-context.cpp rejects that pair), so the V half is charged per
+    // layer. That under-counts a load that explicitly disables flash
+    // attention, by the spread between the largest V row and the smaller ones
+    // — nothing at all on a model with uniform head counts, and bounded by the
+    // windowed half on a Gemma, whose windowed cache is a few hundred cells.
     //
     // Two buckets, because llama_kv_cache_iswa allocates two caches: the
     // full-attention layers at kv_size = n_ctx, and the sliding-window layers
@@ -520,16 +534,26 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
             if (v_swa == 0) v_swa = v_full;
 
             // Layers from this index on reuse an earlier layer's cache rather
-            // than owning one (llama_hparams::has_kv, driven by the
-            // layer_reuse_cb in llama-model.cpp). Only honoured for the
-            // architectures whose loader in this tree actually reads
-            // attention.shared_kv_layers — see models/gemma4.cpp. Every other
-            // architecture keeps all n_layer caches, even if it happens to
-            // carry the key.
+            // than owning one: llama_kv_cache's constructor skips every layer
+            // for which hparams.has_kv(il) is false before it allocates
+            // anything, and the layer_reuse_cb in llama-model.cpp then points
+            // those layers at a cache that already exists. has_kv(il) is
+            // `il < n_layer_kv_from_start` (llama-hparams.cpp), so the
+            // cache-owning layers are always a prefix.
+            //
+            // Only the architectures whose loader in this tree sets
+            // n_layer_kv_from_start have one: gemma4 derives it from
+            // attention.shared_kv_layers (models/gemma4.cpp) and gemma3n
+            // hardcodes twenty regardless of what the file says
+            // (models/gemma3n.cpp). Every other architecture leaves it at -1
+            // and keeps all n_layer caches, even if it happens to carry the
+            // key.
             uint64_t n_layer_kv = n_layer;
             if (arch == "gemma4" || arch == "gemma4-assistant") {
                 const uint64_t shared = get_uint(arch + ".attention.shared_kv_layers");
                 if (shared < n_layer) n_layer_kv = n_layer - shared;
+            } else if (arch == "gemma3n") {
+                n_layer_kv = std::min<uint64_t>(20, n_layer);
             }
 
             // Which layers are windowed, taken only from an explicit per-layer
@@ -553,21 +577,19 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
                 v_full = std::max(v_full, v_swa);
             }
 
-            // n_embd_v_gqa_max(): the largest V row any layer needs, which is
-            // what every layer gets charged when v_trans (see this block's
-            // header). Taken over all n_layer entries, not just the
-            // cache-owning ones, matching llama_hparams' own loop.
-            uint64_t v_gqa_max = 0;
-            for (uint64_t il = 0; il < n_layer; il++) {
-                const uint64_t v_len = (have_swa && is_swa[il]) ? v_swa : v_full;
-                v_gqa_max = std::max(v_gqa_max, n_head_kv[il] * v_len);
-            }
-
+            // n_embd_k_gqa(il) + n_embd_v_gqa(il), summed over the layers that
+            // own a cache and split by the bucket llama_kv_cache_iswa's two
+            // filters would put each one in (llama-kv-cache-iswa.cpp: the base
+            // cache takes !is_swa(il), the SWA cache takes is_swa(il)).
             for (uint64_t il = 0; il < n_layer_kv; il++) {
-                if (have_swa && is_swa[il]) {
-                    kv_swa_elements += n_head_kv[il] * k_swa + v_gqa_max;
+                const bool swa = have_swa && is_swa[il];
+                const uint64_t elements = n_head_kv[il]
+                    * ((swa ? k_swa : k_full) + (swa ? v_swa : v_full));
+
+                if (swa) {
+                    kv_swa_elements += elements;
                 } else {
-                    kv_full_elements += n_head_kv[il] * k_full + v_gqa_max;
+                    kv_full_elements += elements;
                 }
             }
 
