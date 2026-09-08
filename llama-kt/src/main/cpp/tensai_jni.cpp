@@ -765,8 +765,19 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // Kotlin interface attendue : interface TokenCallback { fun onToken(token: String) }
 // cbChat (nullable) : interface ChatParseCallback {
 //     fun onChatParse(content: String, reasoningContent: String) }
+//
+// Returns the number of tokens the decode actually sampled
+// (completion->num_tokens_predicted), which is the only figure that can be
+// compared against n_predict to tell "the model ended its turn" from "the
+// model ran out of budget". Counting onToken() calls on the Kotlin side is
+// not that figure and never was (TEN-79): `emit` below holds tokens back —
+// for an incomplete UTF-8 sequence (any accented character split across two
+// tokens), and for a partial stop-sequence match — so a callback can cover
+// several tokens, or none. Under-counting there reads as a Complete reply on
+// a decode that was cut off mid-sentence. Zero on every early exit: nothing
+// was generated.
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         JNIEnv* env,
         jobject /* thiz */,
@@ -782,12 +793,12 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jobject cb,
         jobject cbChat)
 {
-    if (h == 0L) return;
+    if (h == 0L) return 0;
     auto* rnctx = to_ctx(h);
 
     if (rnctx->completion == nullptr) {
         LOGE("nativeCompletion: completion context is null");
-        return;
+        return 0;
     }
 
     // Resolve callback method once
@@ -796,7 +807,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     if (onToken == nullptr) {
         LOGE("nativeCompletion: onToken method not found");
         env->DeleteLocalRef(cbClass);
-        return;
+        return 0;
     }
 
     jclass    chatCbClass = nullptr;
@@ -914,7 +925,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         LOGE("nativeCompletion: initSampling failed");
         env->DeleteLocalRef(cbClass);
         if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
-        return;
+        return 0;
     }
 
     // Tokenise and load prompt (no media)
@@ -1077,6 +1088,11 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
 
     env->DeleteLocalRef(cbClass);
     if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
+
+    // Read after the loop, not accumulated alongside it: rewind() zeroes it on
+    // entry and doCompletion() is the only thing that raises it, so this is the
+    // decode's own count and nothing else's.
+    return static_cast<jint>(comp->num_tokens_predicted);
 }
 
 // ---------------------------------------------------------------------------

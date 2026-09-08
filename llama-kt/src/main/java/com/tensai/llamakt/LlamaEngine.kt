@@ -256,6 +256,15 @@ class LlamaEngine {
      *   [formatChat]: streams the same reply already split into answer and
      *   reasoning by llama.cpp's chat parser. See [ChatParseCallback] for when
      *   it does *not* fire (it is best-effort, and callers need a fallback).
+     *
+     * @return how many tokens the decode sampled. Compare it against
+     *   [SamplingParams.nPredict] to tell a reply the model ended itself from
+     *   one that ran out of budget — this is the count llama.cpp itself kept,
+     *   and **not** the number of [TokenCallback] invocations, which is a
+     *   different (smaller, and unrelated) number: tokens are held back while a
+     *   UTF-8 sequence is incomplete or a stop sequence is half-matched, so one
+     *   callback can carry several tokens. `0` when the completion could not
+     *   start at all.
      */
     fun completion(
         prompt: String,
@@ -289,7 +298,7 @@ class LlamaEngine {
         stopSequences: Array<String>,
         cb: TokenCallback,
         cbChat: ChatParseCallback?,
-    )
+    ): Int
     private external fun nativeFormatChat(h: Long, messagesJson: String, enableThinking: Boolean): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int

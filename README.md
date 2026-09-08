@@ -111,8 +111,10 @@ class LlamaEngine {
              flashAttn: String? = null)
     // chatParseCallback (optional, best-effort): reply already split into answer/reasoning by
     // llama.cpp's own chat parser — only fires when `prompt` came from formatChat() below
+    // Returns tokens sampled — compare against params.nPredict to tell a finished reply from a
+    // truncated one. Not the number of TokenCallback calls: tokens are held back mid-UTF-8.
     fun completion(prompt: String, params: SamplingParams = SamplingParams(), callback: TokenCallback,
-                   chatParseCallback: ChatParseCallback? = null)
+                   chatParseCallback: ChatParseCallback? = null): Int
     // enableThinking=false renders thinking models (Qwen3…) with reasoning disabled:
     // measured 512 tokens / 106s -> 18 tokens / 7s on the same arithmetic prompt
     // Also records the chat format + parser llama.cpp derived from the template, for the above.
