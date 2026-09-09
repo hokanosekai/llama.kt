@@ -18,6 +18,7 @@
 #include <jni.h>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -111,6 +112,52 @@ JNI_OnLoad(JavaVM* /* vm */, void* /* reserved */) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// C++ exception barrier for the JNI boundary (TEN-91).
+//
+// A C++ exception is not a Java exception. Unwinding out of a native frame
+// into the JVM's has no handler to land in, so it runs off the top and
+// std::terminate() kills the process — no stack trace, no logcat line of our
+// own, nothing a Kotlin `try` or `runCatching` can see, because there is no
+// Throwable to catch. The app is simply gone.
+//
+// Nearly everything below can throw. nlohmann::json's default error handler
+// raises type_error.316 on any string that isn't valid UTF-8, and the GGUF
+// reader does not validate the strings it hands out (gguf.cpp reads a length
+// and that many bytes, no more), so a corrupted `general.name` in a header was
+// enough to take the process down from nativeReadGgufMetadata — including on
+// the start-up path that re-reads every stored model, which turned one damaged
+// file into a crash on every launch. llama.cpp's loaders throw
+// std::runtime_error, and every std::string/std::vector here can throw
+// std::bad_alloc.
+//
+// So each entry point that can allocate or call into llama.cpp is a thin
+// wrapper: the work lives in a `*_impl` and the exported symbol runs it inside
+// jni_guard(), which logs the escape and answers with the failure value the
+// Kotlin side already handles — nullptr, 0, -1, "". Deliberately no new Java
+// exception class: the callers that already treat "the native side said no" as
+// recoverable now cover "the native side threw" for free, with no new catch to
+// add and no contract to change.
+//
+// The three that are not wrapped read a field and return it —
+// nativeKvShapeVersion (a compile-time constant), nativeKvCacheUsedCells and
+// nativeInterrupt. Nothing in them allocates, so there is nothing to catch;
+// anything added to one of them wants a wrapper.
+//
+// `on_throw` is a callable, not a value, so a fallback may itself be a JNI call
+// (NewStringUTF, NewIntArray) rather than only a scalar. It must return the
+// same type as `body`.
+template <typename F, typename G>
+static auto jni_guard(const char* fn, F&& body, G&& on_throw) -> decltype(body()) {
+    try {
+        return body();
+    } catch (const std::exception& e) {
+        LOGE("%s: C++ exception at the JNI boundary: %s", fn, e.what());
+    } catch (...) {
+        LOGE("%s: unknown C++ exception at the JNI boundary", fn);
+    }
+    return on_throw();
+}
 
 static rnllama::llama_rn_context* to_ctx(jlong h) {
     return reinterpret_cast<rnllama::llama_rn_context*>(static_cast<uintptr_t>(h));
@@ -253,14 +300,25 @@ static void chat_state_set_prompt(const void* key, std::string prompt) {
 //   type     — "cpu" | "gpu" | "igpu" | "accel"
 //   deviceName — human-readable device name (e.g. "Mali-G68 MC4")
 
+// backend_devices_info() builds and dumps a nlohmann::json out of driver-
+// supplied device names, so it throws on the same UTF-8 rule as everything
+// else — the fallback is an empty JSON array, which availableBackends()
+// parses into an empty list rather than a null it doesn't expect.
+static jstring listBackends_impl(JNIEnv* env)
+{
+    std::string info = rnllama::backend_devices_info();
+    LOGI("nativeListBackends: %s", info.c_str());
+    return env->NewStringUTF(info.c_str());
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_tensai_llamakt_LlamaEngine_nativeListBackends(
         JNIEnv* env,
         jobject /* thiz */)
 {
-    std::string info = rnllama::backend_devices_info();
-    LOGI("nativeListBackends: %s", info.c_str());
-    return env->NewStringUTF(info.c_str());
+    return jni_guard("nativeListBackends",
+                     [&] { return listBackends_impl(env); },
+                     [&] { return env->NewStringUTF("[]"); });
 }
 
 // ---------------------------------------------------------------------------
@@ -274,11 +332,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeListBackends(
 // not expose a "which backend is my context using" API at the public level.
 // Returns a string like "Vulkan: Mali-G68 MC4" or "CPU: ARM CPU".
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
-        JNIEnv* env,
-        jobject /* thiz */,
-        jlong h)
+static jstring activeBackend_impl(JNIEnv* env, jlong h)
 {
     if (h == 0L) {
         return env->NewStringUTF("CPU (no model loaded)");
@@ -326,6 +380,17 @@ Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
     return env->NewStringUTF("CPU (GPU requested but unavailable)");
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong h)
+{
+    return jni_guard("nativeActiveBackend",
+                     [&] { return activeBackend_impl(env, h); },
+                     [&] { return env->NewStringUTF("unknown"); });
+}
+
 // ---------------------------------------------------------------------------
 // nativeReadGgufMetadata  (static — reads the GGUF header only, no weights)
 // ---------------------------------------------------------------------------
@@ -337,11 +402,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeActiveBackend(
 // no_alloc=true → only the key-value header and tensor infos are read; a
 // multi-GB model is inspected in milliseconds. Returns nullptr on failure.
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
-        JNIEnv* env,
-        jclass /* clazz */,
-        jstring path)
+static jstring readGgufMetadata_impl(JNIEnv* env, jstring path)
 {
     const std::string fpath = jstring_to_std(env, path);
 
@@ -354,6 +415,13 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         LOGE("nativeReadGgufMetadata: failed to open %s", fpath.c_str());
         return nullptr;
     }
+    // Everything between here and lm_gguf_free() can throw (std::string and
+    // nlohmann::json both allocate), and jni_guard() around this function
+    // catches but cannot free a raw pointer it never saw. The context is owned
+    // for the rest of the body so an escape on any of those paths is a caught
+    // failure rather than a leak.
+    const std::unique_ptr<lm_gguf_context, decltype(&lm_gguf_free)>
+        gctx_owner(gctx, &lm_gguf_free);
 
     auto get_str = [&](const std::string& key) -> std::string {
         int64_t i = lm_gguf_find_key(gctx, key.c_str());
@@ -620,11 +688,36 @@ Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
         {"kv_shape_version",           TENSAI_KV_SHAPE_VERSION},
     };
 
-    lm_gguf_free(gctx);
-
-    const std::string out = j.dump();
+    // `replace`, not the default `strict` handler. `architecture` and `name`
+    // come raw out of the GGUF header, which is a length followed by that many
+    // bytes with nothing checking them (gguf.cpp): a truncated download or a
+    // file that was never a GGUF puts arbitrary bytes in a std::string here.
+    // The strict handler answers that with type_error.316, which under the old
+    // code left this function as a C++ exception and killed the process.
+    //
+    // Replacing each bad byte with U+FFFD keeps a model whose name is merely
+    // mis-encoded importable — the name renders with a few replacement
+    // characters instead of the whole file being refused — and U+FFFD is
+    // ordinary 3-byte UTF-8, so NewStringUTF() below takes it as-is.
+    const std::string out = j.dump(-1, ' ', false,
+                                   nlohmann::json::error_handler_t::replace);
     LOGI("nativeReadGgufMetadata: %s", out.c_str());
     return env->NewStringUTF(out.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeReadGgufMetadata(
+        JNIEnv* env,
+        jclass /* clazz */,
+        jstring path)
+{
+    // nullptr is this function's documented "not a readable GGUF" answer, and
+    // both callers already handle it: readMetadata() turns it into a
+    // ModelLoadException the import screen reports, and KvCacheShapeBackfill
+    // skips the row.
+    return jni_guard("nativeReadGgufMetadata",
+                     [&] { return readGgufMetadata_impl(env, path); },
+                     [] { return (jstring) nullptr; });
 }
 
 // ---------------------------------------------------------------------------
@@ -667,10 +760,8 @@ static bool load_progress_trampoline(float progress, void* user_data) {
     return keep_going == JNI_TRUE;
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
+static jlong loadModel_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jstring path,
         jint nGpuLayers,
         jint nCtx,
@@ -679,7 +770,12 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jstring kvCacheType,
         jstring flashAttn)
 {
-    auto* rnctx = new rnllama::llama_rn_context();
+    // Owned rather than raw: loadModel() below runs llama.cpp's whole model
+    // loader, which throws on a file it can't make sense of, and the context
+    // would otherwise leak past jni_guard() — a leak measured in the model's
+    // own footprint, not in bytes.
+    auto rnctx_owner = std::make_unique<rnllama::llama_rn_context>();
+    auto* rnctx = rnctx_owner.get();
 
     common_params p;
     p.model.path   = jstring_to_std(env, path);
@@ -734,17 +830,47 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
 
     if (!ok) {
         LOGE("loadModel failed (or aborted by progress callback)");
-        delete rnctx;
         return 0L;
     }
 
     LOGI("loadModel OK, ptr=%p", rnctx);
-    return static_cast<jlong>(reinterpret_cast<uintptr_t>(rnctx));
+    // Ownership moves to the Kotlin side, which gives it back in nativeFree().
+    return static_cast<jlong>(reinterpret_cast<uintptr_t>(rnctx_owner.release()));
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jstring path,
+        jint nGpuLayers,
+        jint nCtx,
+        jint nThreads,
+        jobject progressCb,
+        jstring kvCacheType,
+        jstring flashAttn)
+{
+    // 0 is the handle value the Kotlin side already reads as "load failed".
+    return jni_guard("nativeLoadModel",
+                     [&] {
+                         return loadModel_impl(env, path, nGpuLayers, nCtx, nThreads,
+                                               progressCb, kvCacheType, flashAttn);
+                     },
+                     [] { return (jlong) 0; });
 }
 
 // ---------------------------------------------------------------------------
 // nativeFree
 // ---------------------------------------------------------------------------
+
+static void free_impl(jlong h)
+{
+    if (h == 0L) return;
+    auto* rnctx = to_ctx(h);
+    LOGI("nativeFree ptr=%p", rnctx);
+    chat_state_erase(rnctx);
+    delete rnctx;
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_tensai_llamakt_LlamaEngine_nativeFree(
@@ -752,11 +878,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
         jobject /* thiz */,
         jlong h)
 {
-    if (h == 0L) return;
-    auto* rnctx = to_ctx(h);
-    LOGI("nativeFree ptr=%p", rnctx);
-    chat_state_erase(rnctx);
-    delete rnctx;
+    // Nothing to answer with — close() is the one call the app makes while
+    // shutting an engine down, and a throw here must not be what stops it.
+    jni_guard("nativeFree", [&] { free_impl(h); }, [] {});
 }
 
 // ---------------------------------------------------------------------------
@@ -777,10 +901,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // a decode that was cut off mid-sentence. Zero on every early exit: nothing
 // was generated.
 
-extern "C" JNIEXPORT jint JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
+static jint completion_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jlong   h,
         jstring prompt,
         jint    nPredict,
@@ -1095,6 +1217,43 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     return static_cast<jint>(comp->num_tokens_predicted);
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring prompt,
+        jint    nPredict,
+        jint    reasoningBudgetTokens,
+        jfloat  temperature,
+        jint    topK,
+        jfloat  topP,
+        jfloat  minP,
+        jobjectArray stopSequences,
+        jobject cb,
+        jobject cbChat)
+{
+    // -1, not the 0 the early exits above use. 0 is a truthful count — nothing
+    // was sampled — and the Kotlin side reads counts by comparing them against
+    // n_predict: `tokensPredicted < nPredict` is StopReason.Complete, so a
+    // decode that died on a C++ exception would be told to the user as a reply
+    // the model finished on its own. That is a quieter lie than the crash this
+    // guard replaced, and this project has spent three tickets removing exactly
+    // that kind of lie.
+    //
+    // A negative count is not a count at all, so it cannot be mistaken for one.
+    // LlamaKtEngineImpl.decode() turns it into a DecodeEvent.Error, the same
+    // terminal event an OOM or a Kotlin-side exception produces.
+    return jni_guard("nativeCompletion",
+                     [&] {
+                         return completion_impl(env, h, prompt, nPredict,
+                                                reasoningBudgetTokens, temperature,
+                                                topK, topP, minP, stopSequences,
+                                                cb, cbChat);
+                     },
+                     [] { return (jint) -1; });
+}
+
 // ---------------------------------------------------------------------------
 // nativeFormatChat
 // ---------------------------------------------------------------------------
@@ -1103,10 +1262,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
 // Passing an empty chat_template string uses the template embedded in the GGUF.
 // Returns the fully formatted prompt string ready for completion.
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
+static jstring formatChat_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jlong   h,
         jstring messagesJson,
         jboolean enableThinking)
@@ -1203,14 +1360,29 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
     return jformatted;
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring messagesJson,
+        jboolean enableThinking)
+{
+    // The two template paths above already catch std::exception, so this only
+    // covers what they can't — a throw from chat_state_put/NewStringUTF after
+    // them, or something that isn't a std::exception. "" is the empty prompt
+    // the h == 0 and legacy-fallback-failed paths return.
+    return jni_guard("nativeFormatChat",
+                     [&] { return formatChat_impl(env, h, messagesJson, enableThinking); },
+                     [&] { return env->NewStringUTF(""); });
+}
+
 // ---------------------------------------------------------------------------
 // nativeTokenize
 // ---------------------------------------------------------------------------
 
-extern "C" JNIEXPORT jintArray JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeTokenize(
+static jintArray tokenize_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jlong   h,
         jstring text)
 {
@@ -1229,6 +1401,20 @@ Java_com_tensai_llamakt_LlamaEngine_nativeTokenize(
     env->SetIntArrayRegion(arr, 0, static_cast<jsize>(tokens.size()),
                            reinterpret_cast<const jint*>(tokens.data()));
     return arr;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeTokenize(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring text)
+{
+    // Kotlin declares this IntArray, not IntArray? — an empty array, the same
+    // answer the h == 0 path gives, rather than a null the caller can't hold.
+    return jni_guard("nativeTokenize",
+                     [&] { return tokenize_impl(env, h, text); },
+                     [&] { return env->NewIntArray(0); });
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,10 +1476,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeInterrupt(
 // rnctx->ctx. Token list = completion->embd (evaluated prompt tokens).
 // Returns token count saved, or -1 on failure.
 
-extern "C" JNIEXPORT jint JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeSaveSession(
+static jint saveSession_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jlong   h,
         jstring path)
 {
@@ -1318,16 +1502,43 @@ Java_com_tensai_llamakt_LlamaEngine_nativeSaveSession(
     return static_cast<jint>(n_tokens);
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeSaveSession(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring path)
+{
+    // -1 is this call's documented failure value; a session that couldn't be
+    // saved is refused, not silently reported as empty.
+    return jni_guard("nativeSaveSession",
+                     [&] { return saveSession_impl(env, h, path); },
+                     [] { return (jint) -1; });
+}
+
 // ---------------------------------------------------------------------------
 // nativeLoadSession
 // ---------------------------------------------------------------------------
 // Wraps llama_state_load_file (b9769 public API).
 // Returns token count loaded, or -1 on failure.
 
-extern "C" JNIEXPORT jint JNICALL
-Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
+// Forces the one state that is always consistent after a restore that did not
+// finish: empty KV cache, empty embd, so the next prefill is a full one. See
+// the long comment at its call site below for why a half-restored cache is
+// worse than no cache at all.
+static void reset_after_failed_session_load(rnllama::llama_rn_context* rnctx) {
+    if (rnctx->completion != nullptr) {
+        rnctx->completion->embd.clear();
+        rnctx->completion->n_past = 0;
+    }
+    auto* mem = llama_get_memory(rnctx->ctx);
+    if (mem != nullptr) {
+        llama_memory_clear(mem, false);
+    }
+}
+
+static jint loadSession_impl(
         JNIEnv* env,
-        jobject /* thiz */,
         jlong   h,
         jstring path)
 {
@@ -1373,14 +1584,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
         // bool, so the two are indistinguishable without patching vendored
         // llama-context.cpp. Cost is one extra prefill on a path where the
         // session file is discarded anyway.
-        if (rnctx->completion != nullptr) {
-            rnctx->completion->embd.clear();
-            rnctx->completion->n_past = 0;
-        }
-        auto* mem = llama_get_memory(rnctx->ctx);
-        if (mem != nullptr) {
-            llama_memory_clear(mem, false);
-        }
+        reset_after_failed_session_load(rnctx);
 
         LOGE("nativeLoadSession: llama_state_load_file failed, path=%s "
              "(KV cache and completion state reset, next prefill will be full)",
@@ -1397,4 +1601,25 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
 
     LOGI("nativeLoadSession: loaded %zu tokens from %s", n_token_count, spath.c_str());
     return static_cast<jint>(n_token_count);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring path)
+{
+    // A throw out of llama_state_load_file() leaves exactly the half-restored
+    // cache the `!ok` branch exists to clean up — same reset here, or the next
+    // prefill would trust cells that describe a conversation nobody is having.
+    return jni_guard("nativeLoadSession",
+                     [&] { return loadSession_impl(env, h, path); },
+                     [&] {
+                         if (h != 0L) {
+                             auto* rnctx = to_ctx(h);
+                             if (rnctx->ctx != nullptr) reset_after_failed_session_load(rnctx);
+                         }
+                         return (jint) -1;
+                     });
 }

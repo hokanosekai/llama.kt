@@ -265,6 +265,14 @@ class LlamaEngine {
      *   UTF-8 sequence is incomplete or a stop sequence is half-matched, so one
      *   callback can carry several tokens. `0` when the completion could not
      *   start at all.
+     *
+     *   **Negative means the native side failed**, and is not a count: a C++
+     *   exception escaped the decode and `tensai_jni.cpp`'s JNI guard turned it
+     *   into a value rather than letting it kill the process. Callers must test
+     *   for that before comparing against [SamplingParams.nPredict] — `-1` is
+     *   below every cap, so a comparison would read a crashed decode as a reply
+     *   the model chose to end. Any tokens already streamed to [callback] stay
+     *   streamed; what is lost is the ending, not the text.
      */
     fun completion(
         prompt: String,
