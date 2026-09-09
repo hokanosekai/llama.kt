@@ -1473,7 +1473,9 @@ Java_com_tensai_llamakt_LlamaEngine_nativeInterrupt(
 // ---------------------------------------------------------------------------
 // Wraps llama_state_save_file (b9769 public API).
 // rn-llama has no dedicated saveSession() — we call llama.cpp directly on
-// rnctx->ctx. Token list = completion->embd (evaluated prompt tokens).
+// rnctx->ctx. Token list = completion->embd, clamped to completion->n_past so
+// the file never claims more tokens than the KV cache it ships with actually
+// holds (TEN-92, see the block in the body).
 // Returns token count saved, or -1 on failure.
 
 static jint saveSession_impl(
@@ -1490,8 +1492,61 @@ static jint saveSession_impl(
     const std::vector<llama_token>* embd =
         (rnctx->completion != nullptr) ? &rnctx->completion->embd : nullptr;
 
-    const llama_token* tokens = (embd && !embd->empty()) ? embd->data() : nullptr;
+    // -----------------------------------------------------------------
+    // Clamp the token list to what the KV cache actually holds (TEN-92)
+    // -----------------------------------------------------------------
+    // embd is the token *list*; n_past is how many of them were decoded into
+    // the cache. llama_state_save_file() writes both the cache and the count
+    // it is handed, and never confronts the two — so whatever is passed here
+    // is what the file claims, true or not.
+    //
+    // They diverge, in rn-completion.cpp's nextToken():
+    //   ended by EOS         — no gap, it returns before the embd.push_back()
+    //   ended by a stop word
+    //   or by n_predict      — one token: the last one is sampled and pushed,
+    //                          and generation stops before it is ever decoded
+    //   aborted mid-graph    — everything left to decode, up to a whole prompt
+    //     (decode_ret == 2)    on a cancelled prefill: that branch advances
+    //                          neither n_past nor embd, unlike the
+    //                          is_interrupted branch below it which resizes
+    //                          embd back down to n_past
+    //
+    // Saving the larger number is what corrupts the restore. nativeLoadSession
+    // sets n_past = N from the file while the cache holds N-1 cells; the next
+    // prefill's find_common_prefix_length() answers N, so
+    // llama_memory_seq_rm(kv, 0, N, -1) removes nothing, and
+    // llama_batch_get_one() carries no explicit positions — they are derived
+    // from seq_pos_max + 1, which is N-1. embd[N-1] drops out of the model's
+    // view and everything after it shifts by one. No error, no log, and it
+    // compounds with every save.
+    //
+    // min(), not n_past outright, and not a fix in rn-completion.cpp: that
+    // file is vendored, and n_past is the honest floor in all three cases
+    // anyway. The decode_ret == 2 comment there says n_past "matches or
+    // undershoots what's actually committed", so clamping can leave real cells
+    // undeclared — which is the harmless direction, because the next prefill's
+    // seq_rm(0, n_past, -1) drops exactly those. Over-declaring is the one that
+    // cannot be recovered from.
     size_t n_tokens = embd ? embd->size() : 0;
+    if (embd != nullptr) {
+        const size_t n_cached = static_cast<size_t>(rnctx->completion->n_past);
+        if (n_cached < n_tokens) {
+            LOGI("nativeSaveSession: %zu tokens sampled but %zu decoded — saving %zu",
+                 n_tokens, n_cached, n_cached);
+            n_tokens = n_cached;
+        } else if (n_cached > n_tokens) {
+            // Never observed and no path in rn-completion.cpp produces it:
+            // loadPrompt() derives n_past from a prefix of embd, the context
+            // shift drops the same count from both, and nativeLoadSession sets
+            // them equal. If this fires, the cache is ahead of the token list
+            // and the file cannot describe it — a defect of its own, not this
+            // one. Saving embd->size() is the conservative read either way.
+            LOGE("nativeSaveSession: n_past=%zu exceeds embd=%zu — token list is "
+                 "behind the KV cache, saving %zu", n_cached, n_tokens, n_tokens);
+        }
+    }
+
+    const llama_token* tokens = (n_tokens > 0) ? embd->data() : nullptr;
 
     bool ok = llama_state_save_file(rnctx->ctx, spath.c_str(), tokens, n_tokens);
     if (!ok) {
