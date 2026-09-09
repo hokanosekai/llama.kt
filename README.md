@@ -200,7 +200,7 @@ Autorun extras: `gpu` (bool), `ngl` (int, explicit layer count), `prompt` (strin
 
 ## Building from source
 
-`scripts/bootstrap.sh` copies llama.cpp sources from the pinned submodule into `llama-kt/src/main/cpp/` and rewrites symbols (`ggml_` → `lm_ggml_`) to avoid collisions. `scripts/build-opencl.sh` builds the `libOpenCL.so` ICD stub from the Khronos submodules. Both run against the `third_party/` submodules — init them first.
+`scripts/bootstrap.sh` copies llama.cpp sources from the pinned submodule into `llama-kt/src/main/cpp/` and rewrites symbols (`ggml_` → `lm_ggml_`) to avoid collisions. It also pulls the `rn-*` glue and the inherited patches from llama.rn, cloned on demand at the revision in [`scripts/llama.rn.rev`](scripts/llama.rn.rev) (default `/tmp/llama.rn-ref`, override with `LLAMA_RN_REF_DIR`). `scripts/build-opencl.sh` builds the `libOpenCL.so` ICD stub from the Khronos submodules. Both run against the `third_party/` submodules — init them first.
 
 ```bash
 git submodule update --init --recursive
@@ -212,6 +212,8 @@ bash scripts/build-opencl.sh
 ## Upstream tracking
 
 The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mtmd.hpp` + the `ggml-opencl/` backend. We extract files, not fork the repo (avoids merge conflicts from the JS side). To pull upstream changes: bump the `third_party/llama.cpp` submodule deliberately (breaking API changes are frequent), re-run `bootstrap.sh`, port relevant `rn-*` changes from a fresh llama.rn checkout, rebuild. The `cpp/jsi/` React Native adapter is intentionally dropped.
+
+**Both upstreams are pinned.** llama.cpp by its submodule sha, llama.rn by `scripts/llama.rn.rev` — a `--depth 1` clone of a moving default branch used to decide what landed in `cpp/`, so two runs a fortnight apart produced different sources with nothing in the repo to say which. `bootstrap.sh` now checks out that sha and aborts if the checkout doesn't match or has been edited in place. The two pins are coupled: the inherited `scripts/patches/` are written against llama.rn's own llama.cpp submodule, so bumping one without the other makes those patches fail — which is now fatal, not a warning. Bump them together.
 
 **Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
 - `0001-vulkan-uma-descriptor-ceildiv.patch`: 64-bit `CEIL_DIV` promotion in `ggml_vk_matmul` descriptor set requests + diagnostic log before the pool assert (fixes [#23057](https://github.com/ggml-org/llama.cpp/issues/23057) on UMA GPUs).

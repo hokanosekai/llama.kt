@@ -13,8 +13,15 @@ OS=$(uname)
 
 LLAMA_DIR="$ROOT_DIR/third_party/llama.cpp"
 CPP_DIR="$ROOT_DIR/llama-kt/src/main/cpp"
-RN_SRC="$ROOT_DIR/third_party/llama.rn-ref/cpp"  # not used directly; we read from /tmp/llama.rn-ref
-LLAMA_RN_CPP="/tmp/llama.rn-ref/cpp"
+
+# llama.rn is not a submodule (see scripts/llama.rn.rev for why): we clone it
+# into a scratch dir and hard-check out the pinned revision. Override the
+# location with LLAMA_RN_REF_DIR if /tmp is inconvenient.
+LLAMA_RN_URL="https://github.com/mybigday/llama.rn"
+LLAMA_RN_REV_FILE="$ROOT_DIR/scripts/llama.rn.rev"
+LLAMA_RN_REF_DIR="${LLAMA_RN_REF_DIR:-/tmp/llama.rn-ref}"
+LLAMA_RN_CPP="$LLAMA_RN_REF_DIR/cpp"
+PATCHES_SRC="$LLAMA_RN_REF_DIR/scripts/patches"
 
 echo "==> Init llama.cpp submodule..."
 git -C "$ROOT_DIR" submodule init "third_party/llama.cpp"
@@ -28,6 +35,57 @@ if [ "$LLAMA_WANT" != "$LLAMA_HAVE" ]; then
 else
   echo "  submodule already at $LLAMA_HAVE, skipping update"
 fi
+
+# ---------------------------------------------------------------------------
+# Pinned llama.rn checkout (rn-* glue + inherited patches)
+# ---------------------------------------------------------------------------
+# Done up front, not at the point of use: the rn-* copy happens ~400 lines
+# below, after the Vulkan shader build, and nobody wants to find out the pin
+# is unreachable twenty minutes in.
+echo "==> Checking out pinned llama.rn..."
+if [ ! -f "$LLAMA_RN_REV_FILE" ]; then
+  echo "ERROR: missing pin file $LLAMA_RN_REV_FILE"
+  exit 1
+fi
+LLAMA_RN_REV=$(grep -v '^#' "$LLAMA_RN_REV_FILE" | tr -d '[:space:]')
+if ! echo "$LLAMA_RN_REV" | grep -qE '^[0-9a-f]{40}$'; then
+  echo "ERROR: $LLAMA_RN_REV_FILE must hold one full 40-char llama.rn commit sha"
+  echo "  got: '$LLAMA_RN_REV'"
+  exit 1
+fi
+
+if [ ! -d "$LLAMA_RN_REF_DIR/.git" ]; then
+  echo "  Cloning $LLAMA_RN_URL into $LLAMA_RN_REF_DIR..."
+  rm -rf "$LLAMA_RN_REF_DIR"
+  # Blobless, no checkout: we only need cpp/ and scripts/patches/ at one
+  # revision. Deliberately not --recursive — llama.rn carries its own
+  # llama.cpp submodule, which we already have in third_party/.
+  git clone --filter=blob:none --no-checkout "$LLAMA_RN_URL" "$LLAMA_RN_REF_DIR"
+fi
+
+LLAMA_RN_HAVE=$(git -C "$LLAMA_RN_REF_DIR" rev-parse HEAD 2>/dev/null || echo "none")
+if [ "$LLAMA_RN_HAVE" != "$LLAMA_RN_REV" ]; then
+  echo "  Fetching $LLAMA_RN_REV..."
+  git -C "$LLAMA_RN_REF_DIR" fetch --no-tags origin "$LLAMA_RN_REV" 2>/dev/null \
+    || git -C "$LLAMA_RN_REF_DIR" fetch --no-tags --unshallow origin 2>/dev/null \
+    || git -C "$LLAMA_RN_REF_DIR" fetch --no-tags origin
+  git -C "$LLAMA_RN_REF_DIR" checkout --force --detach "$LLAMA_RN_REV"
+fi
+
+# The pin only means something if we verify it. A pre-existing checkout at
+# $LLAMA_RN_REF_DIR (older bootstrap runs left a `--depth 1` clone of the
+# default branch there) must not be used as-is.
+LLAMA_RN_HAVE=$(git -C "$LLAMA_RN_REF_DIR" rev-parse HEAD)
+if [ "$LLAMA_RN_HAVE" != "$LLAMA_RN_REV" ]; then
+  echo "ERROR: $LLAMA_RN_REF_DIR is at $LLAMA_RN_HAVE, expected $LLAMA_RN_REV"
+  exit 1
+fi
+if [ -n "$(git -C "$LLAMA_RN_REF_DIR" status --porcelain -- cpp scripts/patches)" ]; then
+  echo "ERROR: $LLAMA_RN_REF_DIR has local edits under cpp/ or scripts/patches/."
+  echo "  Vendored sources must come from a pristine $LLAMA_RN_REV checkout."
+  exit 1
+fi
+echo "  llama.rn at $LLAMA_RN_REV"
 
 echo "==> Creating output directory: $CPP_DIR"
 mkdir -p "$CPP_DIR"
@@ -358,8 +416,7 @@ cp -r "$LLAMA_DIR/vendor/stb/"* "$CPP_DIR/tools/mtmd/stb/" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 echo "==> Copying rn-llama glue from $LLAMA_RN_CPP..."
 if [ ! -d "$LLAMA_RN_CPP" ]; then
-  echo "ERROR: llama.rn cpp sources not found at $LLAMA_RN_CPP"
-  echo "  Clone llama.rn first: git clone --depth 1 https://github.com/mybigday/llama.rn /tmp/llama.rn-ref"
+  echo "ERROR: llama.rn cpp/ missing at $LLAMA_RN_CPP despite a verified checkout"
   exit 1
 fi
 
@@ -373,14 +430,13 @@ cp "$LLAMA_RN_CPP/rn-slot-manager.h"  "$CPP_DIR/rn-slot-manager.h"
 cp "$LLAMA_RN_CPP/rn-slot-manager.cpp" "$CPP_DIR/rn-slot-manager.cpp"
 cp "$LLAMA_RN_CPP/rn-common.hpp"      "$CPP_DIR/rn-common.hpp"
 cp "$LLAMA_RN_CPP/rn-mtmd.hpp"        "$CPP_DIR/rn-mtmd.hpp"
+cp "$LLAMA_RN_CPP/rn-tts.h"           "$CPP_DIR/rn-tts.h"
+cp "$LLAMA_RN_CPP/rn-tts.cpp"         "$CPP_DIR/rn-tts.cpp"
 
 # jsi/ — only the two allowed files (JSINativeHeaders.h, ThreadPool.{h,cpp})
 cp "$LLAMA_RN_CPP/jsi/JSINativeHeaders.h"  "$CPP_DIR/jsi/JSINativeHeaders.h"
 cp "$LLAMA_RN_CPP/jsi/ThreadPool.h"        "$CPP_DIR/jsi/ThreadPool.h"
 cp "$LLAMA_RN_CPP/jsi/ThreadPool.cpp"      "$CPP_DIR/jsi/ThreadPool.cpp"
-
-# rn-tts is optional — copy if present (not in GARDER list but harmless)
-# Skipped intentionally.
 
 # ---------------------------------------------------------------------------
 # LM_ prefix rewrite on ggml/gguf symbols
@@ -462,18 +518,49 @@ done
 # ---------------------------------------------------------------------------
 # Apply patches from llama.rn (Android-compatible ones)
 # ---------------------------------------------------------------------------
-echo "==> Applying patches..."
-PATCHES_SRC="/tmp/llama.rn-ref/scripts/patches"
-if [ -d "$PATCHES_SRC" ]; then
-  for patch_file in "$PATCHES_SRC"/*.patch; do
-    [ -f "$patch_file" ] || continue
-    echo "  Applying patch: $(basename $patch_file)"
-    # --batch: don't ask questions — skip hunks that don't apply
-    patch --batch -p0 -d "$CPP_DIR" < "$patch_file" || {
-      echo "  WARNING: patch $(basename $patch_file) failed (may be iOS/metal specific), skipping"
-    }
-  done
+echo "==> Applying patches inherited from llama.rn..."
+if [ ! -d "$PATCHES_SRC" ]; then
+  echo "ERROR: inherited patches not found at $PATCHES_SRC"
+  echo "  The pinned llama.rn checkout is incomplete."
+  exit 1
 fi
+
+# The only patches allowed not to apply are those whose target we deliberately
+# don't vendor (see the ggml-metal / ggml-hexagon skips at the top). Everything
+# else failing means the sources moved under the patch — same discipline as the
+# local patches/ below, because a skipped hunk here is a fix silently lost.
+patches_not_vendored=(
+  ggml-metal-flash-attn-smem.patch   # ggml-metal/ggml-metal-ops.cpp — iOS only
+  ggml-metal-mul-mv-id-tiitg.patch   # ggml-metal/ggml-metal.metal   — iOS only
+  ggml-hexagon.cpp.patch             # ggml-hexagon/                 — not needed
+)
+
+for patch_file in "$PATCHES_SRC"/*.patch; do
+  [ -f "$patch_file" ] || continue
+  patch_name=$(basename "$patch_file")
+
+  skip=0
+  for not_vendored in "${patches_not_vendored[@]}"; do
+    [ "$patch_name" = "$not_vendored" ] && skip=1
+  done
+  if [ "$skip" -eq 1 ]; then
+    echo "  Skipping patch (target not vendored): $patch_name"
+    continue
+  fi
+
+  echo "  Applying patch: $patch_name"
+  # --batch: never prompt. A non-zero exit means at least one hunk was rejected.
+  if ! patch --batch -p0 -d "$CPP_DIR" < "$patch_file"; then
+    echo ""
+    echo "  ERROR: inherited patch $patch_name does not apply cleanly."
+    echo "  Either third_party/llama.cpp moved under it, or llama.rn changed it."
+    echo "  Resolve deliberately — do not skip it: bump scripts/llama.rn.rev to a"
+    echo "  llama.rn revision matching the llama.cpp pin, or add $patch_name to"
+    echo "  patches_not_vendored above with the reason. See the .rej files in"
+    echo "  $CPP_DIR."
+    exit 1
+  fi
+done
 
 # Cleanup .orig files
 find "$CPP_DIR" -name "*.orig" -delete
@@ -521,4 +608,5 @@ echo ""
 echo "==> Bootstrap complete!"
 echo "    Output: $CPP_DIR"
 echo "    llama.cpp commit: $(git -C "$LLAMA_DIR" rev-parse HEAD)"
+echo "    llama.rn commit:  $LLAMA_RN_REV"
 echo "    Build number: $BUILD_NUMBER, commit: $BUILD_COMMIT"

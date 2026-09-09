@@ -1,0 +1,16 @@
+# Pinned mybigday/llama.rn revision that produced the vendored rn-* glue in
+# llama-kt/src/main/cpp/ and the inherited patches in scripts/patches/.
+#
+# v0.12.5 — https://github.com/mybigday/llama.rn/releases/tag/v0.12.5
+#
+# Established empirically (TEN-87): every vendored rn-*.{h,cpp,hpp} and
+# jsi/{JSINativeHeaders.h,ThreadPool.{h,cpp}} blob is byte-identical to this
+# commit's cpp/ tree. bootstrap.sh copies them verbatim (the LM_ rewrite
+# explicitly skips rn-*), so the git blob hashes match directly. Corroborated
+# by llama.rn v0.12.5 pinning llama.cpp at c926ad09857517978575d6a74d225b463f7417a0,
+# the same commit as our third_party/llama.cpp.
+#
+# To bump: pick the new llama.rn revision, put its full sha here, re-run
+# bootstrap.sh, and re-port patches/0002 if the rn-completion/rn-llama hunks
+# moved.
+c96ec2d36c6555b4230a276f4e29f964bd8d92d5
