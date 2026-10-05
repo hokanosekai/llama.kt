@@ -32,6 +32,7 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "tensai_utf.h"
 
 #include <sys/stat.h>
 
@@ -163,18 +164,48 @@ static rnllama::llama_rn_context* to_ctx(jlong h) {
     return reinterpret_cast<rnllama::llama_rn_context*>(static_cast<uintptr_t>(h));
 }
 
+// TEN-70: Java strings cross this boundary as UTF-16 and are converted by hand
+// (tensai_utf.h), never through GetStringUTFChars/NewStringUTF. The JNI spec
+// says those speak *modified* UTF-8, where an emoji is a 6-byte CESU-8
+// surrogate pair. ART does not follow the spec there: it emits and accepts
+// 4-byte UTF-8 for supplementary characters, which is why the old code
+// tokenized emojis correctly on device (measured 2026-10-05: the old
+// conversion passes JniUtf8BoundaryTest too). What the hand conversion still
+// buys: no reliance on that ART behaviour, invalid UTF-8 from llama.cpp turned
+// into U+FFFD instead of a CheckJNI abort, and embedded NULs that survive.
+// NewStringUTF stays only for ASCII literals, where every encoding agrees.
 static std::string jstring_to_std(JNIEnv* env, jstring js) {
     if (js == nullptr) return "";
-    const char* chars = env->GetStringUTFChars(js, nullptr);
-    std::string result(chars);
-    env->ReleaseStringUTFChars(js, chars);
+    const jsize len = env->GetStringLength(js);
+    const jchar* chars = env->GetStringChars(js, nullptr);
+    if (chars == nullptr) return "";  // OOM, an exception is pending
+    std::string result;
+    try {
+        result = tensai_utf::utf16_to_utf8(
+            reinterpret_cast<const char16_t*>(chars), static_cast<size_t>(len));
+    } catch (...) {
+        // bad_alloc is the only realistic throw; release before jni_guard
+        // sees it, or the pinned chars leak.
+        env->ReleaseStringChars(js, chars);
+        throw;
+    }
+    env->ReleaseStringChars(js, chars);
     return result;
 }
 
+// Invalid UTF-8 in `s` comes out as U+FFFD (see tensai_utf::utf8_to_utf16),
+// so unlike NewStringUTF this never aborts the VM, whatever the bytes.
+static jstring std_to_jstring(JNIEnv* env, const std::string& s) {
+    const std::u16string u = tensai_utf::utf8_to_utf16(s.data(), s.size());
+    return env->NewString(reinterpret_cast<const jchar*>(u.data()),
+                          static_cast<jsize>(u.size()));
+}
+
 // A llama.cpp token can end mid-way through a multi-byte UTF-8 character
-// (one visible char can span several tokens — emoji, accents, CJK).
-// Passing those partial bytes to NewStringUTF aborts the VM
-// ("JNI DETECTED ERROR: input is not valid Modified UTF-8").
+// (one visible char can span several tokens: emoji, accents, CJK).
+// Converting those partial bytes on their own would turn the character into
+// U+FFFD replacement characters (std_to_jstring) instead of the character
+// itself once its next token arrives.
 //
 // Splits buf into an emittable part (complete, valid sequences only —
 // stray invalid bytes are dropped) and leaves the trailing incomplete
@@ -210,7 +241,7 @@ static std::string utf8_take_complete(std::string& buf) {
 // stream tail we own: returns a copy stripped of any trailing incomplete
 // sequence (and of stray invalid bytes). Needed because the chat parser hands
 // back slices of the raw generated text, which during a partial parse can end
-// mid multi-byte character — NewStringUTF() aborts the VM on those.
+// mid multi-byte character (which would surface as U+FFFD on the Kotlin side).
 static std::string utf8_sanitized_copy(const std::string& s) {
     std::string buf = s;
     return utf8_take_complete(buf);
@@ -308,7 +339,7 @@ static jstring listBackends_impl(JNIEnv* env)
 {
     std::string info = rnllama::backend_devices_info();
     LOGI("nativeListBackends: %s", info.c_str());
-    return env->NewStringUTF(info.c_str());
+    return std_to_jstring(env, info);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -351,7 +382,7 @@ static jstring activeBackend_impl(JNIEnv* env, jlong h)
                 const char* name = lm_ggml_backend_dev_name(dev);
                 std::string result = std::string("CPU: ") + (name ? name : "ARM CPU");
                 LOGI("nativeActiveBackend: %s", result.c_str());
-                return env->NewStringUTF(result.c_str());
+                return std_to_jstring(env, result);
             }
         }
         return env->NewStringUTF("CPU");
@@ -371,7 +402,7 @@ static jstring activeBackend_impl(JNIEnv* env, jlong h)
             std::string result = std::string(backend_name ? backend_name : "GPU")
                                + ": " + (dev_name ? dev_name : "unknown");
             LOGI("nativeActiveBackend: %s", result.c_str());
-            return env->NewStringUTF(result.c_str());
+            return std_to_jstring(env, result);
         }
     }
 
@@ -697,12 +728,13 @@ static jstring readGgufMetadata_impl(JNIEnv* env, jstring path)
     //
     // Replacing each bad byte with U+FFFD keeps a model whose name is merely
     // mis-encoded importable — the name renders with a few replacement
-    // characters instead of the whole file being refused — and U+FFFD is
-    // ordinary 3-byte UTF-8, so NewStringUTF() below takes it as-is.
+    // characters instead of the whole file being refused. (std_to_jstring below
+    // would map bad bytes to U+FFFD on its own too; replacing them here first
+    // is what keeps nlohmann from throwing.)
     const std::string out = j.dump(-1, ' ', false,
                                    nlohmann::json::error_handler_t::replace);
     LOGI("nativeReadGgufMetadata: %s", out.c_str());
-    return env->NewStringUTF(out.c_str());
+    return std_to_jstring(env, out);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1114,8 +1146,8 @@ static jint completion_impl(
         // Both can end mid multi-byte character on a partial parse.
         const std::string safe_content   = utf8_sanitized_copy(last_content);
         const std::string safe_reasoning = utf8_sanitized_copy(last_reasoning);
-        jstring jcontent   = env->NewStringUTF(safe_content.c_str());
-        jstring jreasoning = env->NewStringUTF(safe_reasoning.c_str());
+        jstring jcontent   = std_to_jstring(env, safe_content);
+        jstring jreasoning = std_to_jstring(env, safe_reasoning);
         if (jcontent != nullptr && jreasoning != nullptr) {
             env->CallVoidMethod(cbChat, onChatParse, jcontent, jreasoning);
         }
@@ -1123,14 +1155,14 @@ static jint completion_impl(
         if (jreasoning != nullptr) env->DeleteLocalRef(jreasoning);
     };
 
-    // UTF-8 holdback buffer: only complete sequences ever reach NewStringUTF.
+    // UTF-8 holdback buffer: only complete sequences ever reach std_to_jstring.
     std::string utf8_buf;
     auto emit = [&](const std::string& s) {
         if (s.empty()) return;
         utf8_buf += s;
         const std::string ready = utf8_take_complete(utf8_buf);
         if (ready.empty()) return;
-        jstring jtok = env->NewStringUTF(ready.c_str());
+        jstring jtok = std_to_jstring(env, ready);
         env->CallVoidMethod(cb, onToken, jtok);
         env->DeleteLocalRef(jtok);
     };
@@ -1374,14 +1406,16 @@ static jstring formatChat_impl(
 
     LOGI("nativeFormatChat: formatted %zu chars (thinking=%d)", formatted.size(), enableThinking);
 
-    jstring jformatted = env->NewStringUTF(formatted.c_str());
+    jstring jformatted = std_to_jstring(env, formatted);
     // Record the prompt as nativeCompletion will actually see it, not as it was
-    // built here: JNI's modified UTF-8 is not the identity round-trip on
-    // characters outside the BMP (an emoji in the user's message comes back as
-    // a 6-byte CESU-8 surrogate pair, not the 4-byte UTF-8 it went in as), and
-    // the equality check that gates chat parsing would then fail — silently
-    // disabling the reasoning split for exactly the conversations that contain
-    // one.
+    // built here: the equality check that gates chat parsing compares against
+    // the string Kotlin hands back, after std_to_jstring + jstring_to_std. For
+    // valid UTF-8 (emoji included) that round-trip is the identity (TEN-70), so
+    // this is `formatted` byte for byte. It is kept anyway because template
+    // output is not guaranteed to be valid UTF-8 (a GGUF-supplied template can
+    // emit anything): each ill-formed subpart comes back as U+FFFD, and storing
+    // the round-tripped string keeps the check true for that prompt instead of
+    // silently disabling the reasoning split.
     chat_state_set_prompt(rnctx, jstring_to_std(env, jformatted));
     return jformatted;
 }
@@ -1395,7 +1429,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
         jboolean enableThinking)
 {
     // The two template paths above already catch std::exception, so this only
-    // covers what they can't — a throw from chat_state_put/NewStringUTF after
+    // covers what they can't: a throw from chat_state_put/std_to_jstring after
     // them, or something that isn't a std::exception. "" is the empty prompt
     // the h == 0 and legacy-fallback-failed paths return.
     return jni_guard("nativeFormatChat",
