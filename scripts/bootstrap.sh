@@ -139,50 +139,9 @@ cp "$LLAMA_DIR/ggml/include/ggml-vulkan.h"            "$CPP_DIR/ggml-vulkan/"
 
 # 2. Build vulkan-shaders-gen for host and generate SPIR-V shaders
 #    Prerequisites: cmake, glslc (from shaderc/glslang), g++
-VK_SHADERS_SRC="$LLAMA_DIR/ggml/src/ggml-vulkan/vulkan-shaders"
-VK_BUILD_DIR="/tmp/llama-kt-vk-shaders-build"
-VK_SPV_DIR="/tmp/llama-kt-vk-shaders-spv"
-VK_OUT_DIR="/tmp/llama-kt-vk-shaders-out"
-
-# Start the outputs from empty: shaders upstream deletes would otherwise survive
-# in VK_OUT_DIR and in shaders/, which CMakeLists globs into the build.
-rm -rf "$VK_SPV_DIR" "$VK_OUT_DIR"
-rm -f "$CPP_DIR/ggml-vulkan/shaders/"*.comp.cpp
-mkdir -p "$VK_BUILD_DIR" "$VK_SPV_DIR" "$VK_OUT_DIR"
-
-echo "  Building vulkan-shaders-gen for host..."
-cmake -S "$VK_SHADERS_SRC" -B "$VK_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -Wno-dev > /dev/null 2>&1
-cmake --build "$VK_BUILD_DIR" --config Release -j$(nproc) > /dev/null 2>&1
-VK_GEN="$VK_BUILD_DIR/vulkan-shaders-gen"
-
-if [ ! -x "$VK_GEN" ]; then
-  echo "ERROR: vulkan-shaders-gen build failed — cannot generate Vulkan shaders"
-  exit 1
-fi
-
-echo "  Generating ggml-vulkan-shaders.hpp header..."
-"$VK_GEN" \
-  --output-dir "$VK_SPV_DIR" \
-  --target-hpp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp"
-
-echo "  Compiling GLSL shaders to SPIR-V and generating per-shader .cpp files..."
-for comp in "$VK_SHADERS_SRC"/*.comp; do
-  base=$(basename "$comp")
-  "$VK_GEN" \
-    --glslc "$(which glslc)" \
-    --source "$comp" \
-    --output-dir "$VK_SPV_DIR" \
-    --target-hpp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp" \
-    --target-cpp "$VK_OUT_DIR/${base}.cpp"
-done
-
-cp "$VK_OUT_DIR/ggml-vulkan-shaders.hpp" "$CPP_DIR/ggml-vulkan/"
-
-# Fix relative include in shader cpp files (they're compiled from shaders/ subdir)
-for f in "$VK_OUT_DIR"/*.cpp; do
-  sed 's|#include "ggml-vulkan-shaders.hpp"|#include "../ggml-vulkan-shaders.hpp"|g' "$f" \
-    > "$CPP_DIR/ggml-vulkan/shaders/$(basename "$f")"
-done
+#    Procedure lives in gen-vulkan-shaders.sh (shared with CI and the README).
+GLSLC=$(command -v glslc) || { echo "ERROR: glslc not found in PATH (shaderc/glslang)" >&2; exit 1; }
+"$ROOT_DIR/scripts/gen-vulkan-shaders.sh" "$GLSLC"
 
 # 3. Bundle Vulkan C++ binding headers (vulkan.hpp — not in NDK sysroot)
 VULKAN_HEADERS_DIR="/tmp/Vulkan-Headers"
