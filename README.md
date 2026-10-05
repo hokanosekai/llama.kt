@@ -217,6 +217,7 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 
 **Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
 - `0001-vulkan-uma-descriptor-ceildiv.patch`: 64-bit `CEIL_DIV` promotion in `ggml_vk_matmul` descriptor set requests + diagnostic log before the pool assert (fixes [#23057](https://github.com/ggml-org/llama.cpp/issues/23057) on UMA GPUs).
+- `0003-vulkan-device-dispatcher-init.patch`: loads device-level Vulkan function pointers after `createDevice` (the Android loader only fills instance-level ones), and turns off `buffer_device_address` when the driver advertises it without exposing `vkGetBufferDeviceAddress` (Mali).
 
 ## Roadmap
 

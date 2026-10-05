@@ -1,0 +1,26 @@
+diff --git a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
+index 6b29b38..c69901f 100644
+--- a/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
++++ b/llama-kt/src/main/cpp/ggml-vulkan/ggml-vulkan.cpp
+@@ -6227,6 +6227,21 @@ static vk_device lm_ggml_vk_get_device(size_t idx) {
+         device_create_info.setPNext(&device_features2);
+         device->device = device->physical_device.createDevice(device_create_info);
+ 
++        // Load device-level function pointers.  On Android/Mali the loader does NOT
++        // return device functions from vkGetInstanceProcAddr — init(instance) only
++        // populates instance-level trampolines.  We must call init(device) here to
++        // populate vkCreateBuffer, vkAllocateMemory, vkMapMemory, etc.
++        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);
++
++        // Guard: if vkGetBufferDeviceAddress is not in the dispatch table (e.g. Mali
++        // driver reports bufferDeviceAddress = true in feature struct but does not
++        // expose the function via vkGetDeviceProcAddr), disable the feature to prevent
++        // a null-pointer call inside lm_ggml_vk_create_buffer.
++        if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress) {
++            LM_GGML_LOG_WARN("lm_ggml_vulkan: vkGetBufferDeviceAddress not available — disabling buffer_device_address\n");
++            device->buffer_device_address = false;
++        }
++
+         // Queues
+         lm_ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+ 
