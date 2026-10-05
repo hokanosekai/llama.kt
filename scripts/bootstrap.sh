@@ -144,6 +144,10 @@ VK_BUILD_DIR="/tmp/llama-kt-vk-shaders-build"
 VK_SPV_DIR="/tmp/llama-kt-vk-shaders-spv"
 VK_OUT_DIR="/tmp/llama-kt-vk-shaders-out"
 
+# Start the outputs from empty: shaders upstream deletes would otherwise survive
+# in VK_OUT_DIR and in shaders/, which CMakeLists globs into the build.
+rm -rf "$VK_SPV_DIR" "$VK_OUT_DIR"
+rm -f "$CPP_DIR/ggml-vulkan/shaders/"*.comp.cpp
 mkdir -p "$VK_BUILD_DIR" "$VK_SPV_DIR" "$VK_OUT_DIR"
 
 echo "  Building vulkan-shaders-gen for host..."
