@@ -491,6 +491,10 @@ for file in "${files_add_lm_prefix[@]}"; do
   # Skip the local ggml-ext.h shim if present
   [[ "$file" == "$CPP_DIR/ggml-ext.h" ]] && continue
 
+  # Skip our own JNI layer: it is not vendored, already spells lm_ggml_, and
+  # the rewrite below is not idempotent (lm_ggml_ -> lm_lm_ggml_).
+  [[ "$file" == "$CPP_DIR/tensai_jni.cpp" ]] && continue
+
   sed -i 's/GGML_/LM_GGML_/g' "$file"
   sed -i 's/ggml_/lm_ggml_/g' "$file"
   sed -i 's/GGUF_/LM_GGUF_/g' "$file"
