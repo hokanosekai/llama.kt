@@ -34,9 +34,25 @@ git -C "$ROOT_DIR" submodule init "third_party/llama.cpp"
 # Otherwise fall back to a full update. We do NOT use --recursive to avoid
 # pulling llama.cpp's own deps (ggml-cuda etc.) which we don't need.
 LLAMA_WANT=$(git -C "$ROOT_DIR" ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
-LLAMA_HAVE=$(git -C "$LLAMA_DIR" rev-parse HEAD 2>/dev/null || echo "none")
-if [ "$LLAMA_WANT" != "$LLAMA_HAVE" ]; then
+# Not checked out: the directory exists but is empty, and `git -C` in it would
+# answer with llama.kt's own HEAD. A checked-out submodule always has `.git`.
+if [ -e "$LLAMA_DIR/.git" ]; then
+  LLAMA_HAVE=$(git -C "$LLAMA_DIR" rev-parse HEAD)
+else
+  LLAMA_HAVE="none"
+fi
+if [ "$LLAMA_HAVE" = "none" ]; then
   git -C "$ROOT_DIR" submodule update "third_party/llama.cpp"
+elif [ "$LLAMA_WANT" != "$LLAMA_HAVE" ]; then
+  # The wanted commit is read from HEAD, so a pin checked out but not yet
+  # committed (step 1 of a bump) differs from it exactly like a submodule left
+  # behind by a pull does, and git cannot tell the two apart. Updating here
+  # used to put the old llama.cpp back without a word and generate against it
+  # (TEN-103). Refuse instead and let the caller say which one it is.
+  echo "ERROR: third_party/llama.cpp is at $LLAMA_HAVE but HEAD pins $LLAMA_WANT." >&2
+  echo "  Bumping? Commit the new gitlink first, then re-run." >&2
+  echo "  Stale checkout? git -C \"$ROOT_DIR\" submodule update third_party/llama.cpp" >&2
+  exit 1
 else
   echo "  submodule already at $LLAMA_HAVE, skipping update"
 fi
