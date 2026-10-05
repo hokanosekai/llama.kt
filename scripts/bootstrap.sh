@@ -159,20 +159,36 @@ cp "$LLAMA_DIR/ggml/include/ggml-vulkan.h"            "$CPP_DIR/ggml-vulkan/"
 GLSLC=$(command -v glslc) || { echo "ERROR: glslc not found in PATH (shaderc/glslang)" >&2; exit 1; }
 "$ROOT_DIR/scripts/gen-vulkan-shaders.sh" "$GLSLC"
 
-# 3. Bundle Vulkan C++ binding headers (vulkan.hpp — not in NDK sysroot)
+# Fetch <url> at exactly <sha> into <dir>, reusing <dir> only if it is already
+# there. A bare `[ -d ]` check used to trust whatever an earlier run had left in
+# /tmp, and SPIRV-Headers was cloned at the tip of its default branch, so two
+# runs at the same pins could vendor different headers (TEN-101).
+fetch_pinned() {
+  local url=$1 sha=$2 dir=$3
+  if [ -e "$dir/.git" ] && [ "$(git -C "$dir" rev-parse HEAD)" = "$sha" ]; then
+    return
+  fi
+  echo "  Fetching $url at $sha..."
+  rm -rf "$dir"
+  git init -q "$dir"
+  git -C "$dir" fetch -q --depth=1 "$url" "$sha"
+  git -C "$dir" checkout -q FETCH_HEAD
+}
+
+# 3. Bundle Vulkan C++ binding headers (vulkan.hpp, not in NDK sysroot)
+#    Vulkan-Headers v1.4.350.
 VULKAN_HEADERS_DIR="/tmp/Vulkan-Headers"
-if [ ! -d "$VULKAN_HEADERS_DIR" ]; then
-  echo "  Cloning Vulkan-Headers for vulkan.hpp..."
-  git clone --depth=1 --branch v1.4.350 https://github.com/KhronosGroup/Vulkan-Headers "$VULKAN_HEADERS_DIR"
-fi
+fetch_pinned https://github.com/KhronosGroup/Vulkan-Headers \
+  8864cdc896bbc2a9b6eb36b3218fc9ef57908d77 "$VULKAN_HEADERS_DIR"
 cp "$VULKAN_HEADERS_DIR/include/vulkan/"*.hpp "$CPP_DIR/vulkan-hpp/vulkan/" 2>/dev/null || true
 
 # 4. Bundle SPIR-V headers (spirv/unified1/spirv.hpp)
+#    No release tag carries the spirv.hpp that was first vendored; daa093d is
+#    the last commit with that exact file (blob 9f3cb01), between c63848e and
+#    575b651 on SPIRV-Headers main.
 SPIRV_HEADERS_DIR="/tmp/SPIRV-Headers"
-if [ ! -d "$SPIRV_HEADERS_DIR" ]; then
-  echo "  Cloning SPIRV-Headers..."
-  git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_DIR"
-fi
+fetch_pinned https://github.com/KhronosGroup/SPIRV-Headers \
+  daa093dd29aab8cbb6562b808370562f56e399fb "$SPIRV_HEADERS_DIR"
 cp "$SPIRV_HEADERS_DIR/include/spirv/unified1/spirv.hpp" "$CPP_DIR/spirv-headers/spirv/unified1/"
 
 echo "  Vulkan setup complete ($(ls "$CPP_DIR/ggml-vulkan/shaders/" | wc -l) shaders)"
