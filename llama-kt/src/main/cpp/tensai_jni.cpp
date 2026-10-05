@@ -1471,7 +1471,10 @@ Java_com_tensai_llamakt_LlamaEngine_nativeInterrupt(
 // ---------------------------------------------------------------------------
 // nativeSaveSession
 // ---------------------------------------------------------------------------
-// Wraps llama_state_save_file (b9769 public API).
+// Wraps llama_state_seq_save_file (b9769 public API), seq 0 only: the file holds
+// the KV cells of the one sequence we use, not the logits/embeddings of the last
+// batch that llama_state_save_file would add (~1.45 MB of dead weight, and a
+// restore never samples from them, see nativeLoadSession).
 // rn-llama has no dedicated saveSession() — we call llama.cpp directly on
 // rnctx->ctx. Token list = completion->embd, clamped to completion->n_past so
 // the file never claims more tokens than the KV cache it ships with actually
@@ -1496,7 +1499,7 @@ static jint saveSession_impl(
     // Clamp the token list to what the KV cache actually holds (TEN-92)
     // -----------------------------------------------------------------
     // embd is the token *list*; n_past is how many of them were decoded into
-    // the cache. llama_state_save_file() writes both the cache and the count
+    // the cache. llama_state_seq_save_file() writes both the cache and the count
     // it is handed, and never confronts the two — so whatever is passed here
     // is what the file claims, true or not.
     //
@@ -1548,9 +1551,11 @@ static jint saveSession_impl(
 
     const llama_token* tokens = (n_tokens > 0) ? embd->data() : nullptr;
 
-    bool ok = llama_state_save_file(rnctx->ctx, spath.c_str(), tokens, n_tokens);
-    if (!ok) {
-        LOGE("nativeSaveSession: llama_state_save_file failed, path=%s", spath.c_str());
+    // Returns the number of bytes written, 0 on failure.
+    const size_t n_written =
+        llama_state_seq_save_file(rnctx->ctx, spath.c_str(), /*seq_id=*/0, tokens, n_tokens);
+    if (n_written == 0) {
+        LOGE("nativeSaveSession: llama_state_seq_save_file failed, path=%s", spath.c_str());
         return -1;
     }
     LOGI("nativeSaveSession: saved %zu tokens to %s", n_tokens, spath.c_str());
@@ -1574,7 +1579,11 @@ Java_com_tensai_llamakt_LlamaEngine_nativeSaveSession(
 // ---------------------------------------------------------------------------
 // nativeLoadSession
 // ---------------------------------------------------------------------------
-// Wraps llama_state_load_file (b9769 public API).
+// Wraps llama_state_seq_load_file (b9769 public API), seq 0 only.
+// Files carry no logits, so after a restore nothing may sample before a decode:
+// rn-completion's loadPrompt() backs n_past off by one when the prompt equals the
+// cached tokens, and nextToken() decodes while n_past < embd.size() before it
+// ever calls the sampler, so the last token is always re-decoded first.
 // Returns token count loaded, or -1 on failure.
 
 // Forces the one state that is always consistent after a restore that did not
@@ -1608,40 +1617,55 @@ static jint loadSession_impl(
     std::vector<llama_token> tokens_out(n_ctx);
     size_t n_token_count = 0;
 
-    bool ok = llama_state_load_file(
+    // Empty seq 0 before reading. llama_kv_cache::state_read() skips a stream
+    // whose cell_count is 0 without ever reaching state_read_meta()'s
+    // seq_rm(dest, -1, -1), so a file saved from an empty cache would "succeed"
+    // and leave the previous conversation's cells in place under a token list
+    // that says otherwise. Other paths already seq_rm inside the load; this
+    // makes it unconditional. Only seq 0 is touched, which is all the seq load
+    // ever writes. seq_rm can refuse on some recurrent/hybrid setups, then fall
+    // back to a full clear.
+    if (auto* mem = llama_get_memory(rnctx->ctx); mem != nullptr) {
+        if (!llama_memory_seq_rm(mem, 0, -1, -1)) {
+            llama_memory_clear(mem, false);
+        }
+    }
+
+    const size_t n_read = llama_state_seq_load_file(
         rnctx->ctx,
         spath.c_str(),
+        /*dest_seq_id=*/0,
         tokens_out.data(),
         tokens_out.size(),
         &n_token_count
     );
 
-    if (!ok) {
-        // llama_state_load_file can fail *after* wiping the KV cache:
-        // llama_kv_cache::state_read_meta() calls clear(true) before reading
-        // cells back, and both failure exits below it leave the cache empty or
-        // half-populated. Returning -1 as-is would keep embd/n_past describing
-        // the previous conversation, and the next prefill would trust
-        // find_common_prefix_length() over cells that no longer exist:
-        // silently wrong attention, no crash, no log. So force the one state
-        // that is always consistent: empty cache, empty embd. Next prefill is
-        // then a full one, the fallback SessionRepository.restore expects.
+    if (n_read == 0) {
+        // The seq load returns 0 on every failure: wrong magic/version (this
+        // is how old llama_state_save_file files, GGSN, are refused: only
+        // GGSQ v2 passes), a truncated file (llama_file throws, caught inside
+        // the API), token count over capacity, n_stream mismatch, bad cell
+        // data. Where it fails matters for what is left in the cache:
+        //   - before state_read_meta (header checks, n_stream mismatch): the
+        //     cache was not touched by the load, but our own seq_rm above
+        //     already emptied seq 0
+        //   - inside it or state_read_data: llama_kv_cache::state_read() and
+        //     llama_memory_recurrent::state_read() seq_rm(0, -1, -1) then
+        //     throw, so seq 0 is empty again, never half-populated
+        // So the cache itself is clean either way; what is stale is embd /
+        // n_past, which still describe the previous conversation. The next
+        // prefill would trust find_common_prefix_length() over cells that no
+        // longer exist: silently wrong attention, no crash, no log. Force the
+        // one consistent state: empty cache, empty embd, so the next prefill
+        // is a full one, the fallback SessionRepository.restore expects.
         //
-        // clear over seq_rm: the whole-cache restore path writes cells for
-        // every seq_id in the file, not just 0, so seq_rm(0, -1, -1) could
-        // leave foreign cells behind, and it can report failure on
-        // recurrent/hybrid models. data=false clears metadata only, the data
-        // buffers are unreachable once no cell refers to them (same choice
-        // rn-completion makes on its own cache-clear fallback).
-        //
-        // This also clears on failures that happened before the cache was
-        // touched (bad magic, truncated header): the public API returns a plain
-        // bool, so the two are indistinguishable without patching vendored
-        // llama-context.cpp. Cost is one extra prefill on a path where the
-        // session file is discarded anyway.
+        // clear rather than seq_rm: also covers cells of any other sequence
+        // and models where seq_rm can report failure. data=false clears
+        // metadata only, the data buffers are unreachable once no cell refers
+        // to them (same choice rn-completion makes on its own fallback).
         reset_after_failed_session_load(rnctx);
 
-        LOGE("nativeLoadSession: llama_state_load_file failed, path=%s "
+        LOGE("nativeLoadSession: llama_state_seq_load_file failed, path=%s "
              "(KV cache and completion state reset, next prefill will be full)",
              spath.c_str());
         return -1;
@@ -1665,9 +1689,10 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
         jlong   h,
         jstring path)
 {
-    // A throw out of llama_state_load_file() leaves exactly the half-restored
-    // cache the `!ok` branch exists to clean up — same reset here, or the next
-    // prefill would trust cells that describe a conversation nobody is having.
+    // A throw out of the seq load (or the clear before it) can leave
+    // stale embd/n_past, which the failure branch exists to clean up. Same reset
+    // here, or the next prefill would trust cells that describe a conversation
+    // nobody is having.
     return jni_guard("nativeLoadSession",
                      [&] { return loadSession_impl(env, h, path); },
                      [&] {
