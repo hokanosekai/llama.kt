@@ -583,7 +583,7 @@ find "$CPP_DIR" -name "*.orig" -delete
 # ---------------------------------------------------------------------------
 # Apply local patches (ours, from patches/ at repo root)
 # Unlike the llama.rn patches above, these MUST apply: they carry fixes the
-# lib depends on (e.g. the Vulkan UMA descriptor fix, upstream #23057).
+# lib depends on (e.g. the Vulkan device dispatcher init, 0003).
 # If one fails after a submodule bump, update the patch deliberately —
 # do not skip it.
 # ---------------------------------------------------------------------------

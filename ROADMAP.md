@@ -16,10 +16,6 @@ What's planned for llama.kt, in rough priority order. This file tracks direction
 - **OpenCL on Adreno** — the backend is compiled in but untested on Adreno hardware; validate and add perf numbers.
 - **Benchmarks** — KleidiAI on/off impact, mmap vs no-mmap+mlock load strategies.
 
-## Upstream
-
-- **Drop the Vulkan UMA patch** once [ggml-org/llama.cpp#23057](https://github.com/ggml-org/llama.cpp/issues/23057) lands upstream — the vendored `0001-vulkan-uma-descriptor-ceildiv.patch` becomes unnecessary.
-
 ## Candidates (not committed)
 
 Ideas under consideration — no timeline, may never happen:

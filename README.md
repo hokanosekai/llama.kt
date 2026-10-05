@@ -17,7 +17,7 @@ Working. Validated on-device (OPPO / MediaTek Dimensity 900, arm64): loads a GGU
 
 Multimodal (vision via `mtmd`) is vendored but not yet wired through the Kotlin API.
 
-**Vulkan UMA fix.** Mobile drivers (Mali, Adreno, CIX) report `maxComputeWorkGroupCount = UINT32_MAX`, which overflows a 32-bit `CEIL_DIV` in `ggml_vk_matmul` and under-requests descriptor sets — batched matmuls (Gemma 3n and others) then abort at model load ([upstream #23057](https://github.com/ggml-org/llama.cpp/issues/23057)). The vendored `ggml-vulkan.cpp` in this repo carries a 2-line 64-bit promotion fix, validated on Mali-G68. The fix lives in [`patches/`](patches/) and is re-applied automatically by `bootstrap.sh`; it can be dropped once it lands upstream.
+**Vulkan UMA fix.** Mobile drivers (Mali, Adreno, CIX) report `maxComputeWorkGroupCount = UINT32_MAX`, which overflows a 32-bit `CEIL_DIV` in `ggml_vk_matmul` and under-requests descriptor sets — batched matmuls (Gemma 3n and others) then abort at model load ([upstream #23057](https://github.com/ggml-org/llama.cpp/issues/23057)). The overflow-safe `CEIL_DIV` was first carried here as a local patch, validated on Mali-G68, and landed upstream as [#25245](https://github.com/ggml-org/llama.cpp/pull/25245); the pinned llama.cpp includes it, so no local patch is needed any more.
 
 **CPU threads.** `load()` defaults to pinning inference threads to the big cores (detected via `cpuinfo_max_freq`). On big.LITTLE SoCs this measured up to 6× faster than llama.cpp's auto-detect, which lets efficiency cores drag the pool down.
 
@@ -216,7 +216,6 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 **Both upstreams are pinned.** llama.cpp by its submodule sha, llama.rn by `scripts/llama.rn.rev` — a `--depth 1` clone of a moving default branch used to decide what landed in `cpp/`, so two runs a fortnight apart produced different sources with nothing in the repo to say which. `bootstrap.sh` now checks out that sha and aborts if the checkout doesn't match or has been edited in place. The two pins are coupled: the inherited `scripts/patches/` are written against llama.rn's own llama.cpp submodule, so bumping one without the other makes those patches fail — which is now fatal, not a warning. Bump them together.
 
 **Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
-- `0001-vulkan-uma-descriptor-ceildiv.patch`: 64-bit `CEIL_DIV` promotion in `ggml_vk_matmul` descriptor set requests + diagnostic log before the pool assert (fixes [#23057](https://github.com/ggml-org/llama.cpp/issues/23057) on UMA GPUs).
 - `0003-vulkan-device-dispatcher-init.patch`: loads device-level Vulkan function pointers after `createDevice` (the Android loader only fills instance-level ones), and turns off `buffer_device_address` when the driver advertises it without exposing `vkGetBufferDeviceAddress` (Mali).
 
 ## Roadmap
