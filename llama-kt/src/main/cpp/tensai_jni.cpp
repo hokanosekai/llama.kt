@@ -1147,13 +1147,23 @@ static jint completion_impl(
     size_t stop_trim_pos = std::string::npos;
 
     while (comp->has_next_token && !comp->is_interrupted) {
+        const size_t generated_before = comp->generated_text.size();
         rnllama::completion_token_output tok_out = comp->doCompletion();
 
         if (tok_out.tok == -1) {
             break;
         }
 
-        const std::string& text = tok_out.text;
+        // What this token added to generated_text, not tok_out.text. Since
+        // llama.rn v0.12.6 doCompletion() appends through utf8_stream_gate,
+        // which holds back an incomplete multi-byte sequence until the next
+        // token and turns an invalid byte into U+FFFD, so the raw piece and
+        // the appended text can differ by 1 to 3 bytes. stop_pos below is an
+        // offset into generated_text: staging the raw piece in `pending` made
+        // the cut land that many bytes off, leaking part of the stop word or
+        // eating content before it (TEN-102). One source for both, and it is
+        // the one the final parse reads.
+        const std::string text = comp->generated_text.substr(generated_before);
 
         if (!has_stops) {
             emit(text);
@@ -1186,6 +1196,22 @@ static jint completion_impl(
             pending.erase(0, partial_pos);
         }
         emit_parse(/* is_partial */ true);
+    }
+
+    // endCompletion() is never called from here, so flush the gate the way it
+    // would: a sequence still incomplete at the end becomes U+FFFD instead of
+    // silently missing from generated_text and from the stream (TEN-102).
+    // After a stop word the tail lies past the cut and is dropped with it.
+    if (!comp->stopped_word) {
+        const std::string tail = comp->utf8_gate.finish();
+        if (!tail.empty()) {
+            comp->generated_text += tail;
+            if (has_stops) {
+                pending += tail;
+            } else {
+                emit(tail);
+            }
+        }
     }
 
     // Generation ended without a stop match (EOS / n_predict / interrupt):
