@@ -144,6 +144,8 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q6_k_f32_flat
     mul_mv_q8_0_f32
     mul_mv_q8_0_f32_flat
+    mul_mv_q1_0_f32
+    mul_mv_q1_0_f32_flat
     mul_mv_iq4_nl_f32
     mul_mv_iq4_nl_f32_flat
     mul_mv_mxfp4_f32
@@ -154,7 +156,9 @@ set(GGML_OPENCL_KERNELS
     mul_mv_id_mxfp4_f32
     mul_mv_id_mxfp4_f32_flat
     gemm_moe_q4_0_f32_ns
+    gemm_moe_q4_0_q8_1_dp4a
     gemv_moe_q4_0_f32_ns
+    gemm_moe_q8_0_f32_ns
     gemm_moe_q4_1_f32_ns
     gemv_moe_q4_1_f32_ns
     gemm_moe_q5_0_f32_ns
@@ -162,6 +166,18 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_q5_1_f32_ns
     gemv_moe_q5_1_f32_ns
     gemm_moe_q4_k_f32_ns
+    gemm_moe_q4_k_q8_1_dp4a
+    gemm_moe_q6_k_q8_1_dp4a
+    gemm_moe_q8_1_dp4a
+    moe_reorder_quant_a_q8_1
+    gemm_noshuffle_q4_k_q8_1_dp4a
+    gemm_noshuffle_q5_k_q8_1_dp4a
+    gemm_noshuffle_q6_k_q8_1_dp4a
+    gemm_noshuffle_q8_0_q8_1_dp4a
+    gemm_noshuffle_q5_0_q8_1_dp4a
+    gemm_noshuffle_iq4_nl_q8_1_dp4a
+    gemm_noshuffle_q4_0_q8_1_dp4a
+    quant_a_q8_1
     gemv_moe_q4_k_f32_ns
     gemm_moe_q5_k_f32_ns
     gemv_moe_q5_k_f32_ns
@@ -170,8 +186,10 @@ set(GGML_OPENCL_KERNELS
     gemm_moe_mxfp4_f32
     gemv_moe_mxfp4_f32
     gemm_moe_mxfp4_f32_ns
+    gemm_moe_mxfp4_q8_1_dp4a
     gemv_moe_mxfp4_f32_ns
     moe_reorder_b
+    moe_combine
     moe_sort_by_expert
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
@@ -180,6 +198,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q5_0_f32_l4_lm
     mul_mm_q5_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
+    mul_mm_q1_0_f32_l4_lm
     mul_mm_iq4_nl_f32_l4_lm
     mul_mm_q4_k_f32_l4_lm
     mul_mm_q5_k_f32_l4_lm
@@ -197,6 +216,8 @@ set(GGML_OPENCL_KERNELS
     gemm_noshuffle_q5_1_f32
     gemv_noshuffle_q8_0_f32
     gemm_noshuffle_q8_0_f32
+    gemv_noshuffle_q1_0_f32
+    gemm_noshuffle_q1_0_f32
     gemv_noshuffle_q4_k_f32
     gemm_noshuffle_q4_k_f32
     gemv_noshuffle_q6_k_f32
@@ -242,6 +263,9 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f32_f16
     flash_attn_f16
     flash_attn_f32
+    flash_attn_pre_f16
+    flash_attn_f32_q8_0
+    flash_attn_f32_q4_0
     gemm_xmem_f16_f32_os8
 )
 

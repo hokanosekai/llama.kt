@@ -8,6 +8,11 @@
 #   - Skips ggml-metal (iOS only) and ggml-hexagon (not needed)
 #   - Applies same LM_ prefix rewrite on ggml/gguf symbols
 
+# The shebang's -e is ignored by `bash scripts/bootstrap.sh`, which is how the
+# README says to run this. Without it a cp of a file upstream removed prints an
+# error and carries on.
+set -e
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OS=$(uname)
 
@@ -269,6 +274,8 @@ cp "$LLAMA_DIR/src/llama-kv-cache.h"                  "$CPP_DIR/llama-kv-cache.h
 cp "$LLAMA_DIR/src/llama-kv-cache.cpp"                "$CPP_DIR/llama-kv-cache.cpp"
 cp "$LLAMA_DIR/src/llama-kv-cache-dsa.h"              "$CPP_DIR/llama-kv-cache-dsa.h"
 cp "$LLAMA_DIR/src/llama-kv-cache-dsa.cpp"            "$CPP_DIR/llama-kv-cache-dsa.cpp"
+cp "$LLAMA_DIR/src/llama-kv-cache-dsv4.h"             "$CPP_DIR/llama-kv-cache-dsv4.h"
+cp "$LLAMA_DIR/src/llama-kv-cache-dsv4.cpp"           "$CPP_DIR/llama-kv-cache-dsv4.cpp"
 cp "$LLAMA_DIR/src/llama-kv-cache-iswa.h"             "$CPP_DIR/llama-kv-cache-iswa.h"
 cp "$LLAMA_DIR/src/llama-kv-cache-iswa.cpp"           "$CPP_DIR/llama-kv-cache-iswa.cpp"
 cp "$LLAMA_DIR/src/llama-memory-hybrid.h"             "$CPP_DIR/llama-memory-hybrid.h"
@@ -327,10 +334,9 @@ cp "$LLAMA_DIR/common/ngram-mod.h"                    "$CPP_DIR/common/ngram-mod
 cp "$LLAMA_DIR/common/ngram-mod.cpp"                  "$CPP_DIR/common/ngram-mod.cpp"
 cp "$LLAMA_DIR/common/json-schema-to-grammar.h"       "$CPP_DIR/common/json-schema-to-grammar.h"
 cp "$LLAMA_DIR/common/json-schema-to-grammar.cpp"     "$CPP_DIR/common/json-schema-to-grammar.cpp"
-cp "$LLAMA_DIR/common/json-partial.h"                 "$CPP_DIR/common/json-partial.h"
-cp "$LLAMA_DIR/common/json-partial.cpp"               "$CPP_DIR/common/json-partial.cpp"
-cp "$LLAMA_DIR/common/regex-partial.h"                "$CPP_DIR/common/regex-partial.h"
-cp "$LLAMA_DIR/common/regex-partial.cpp"              "$CPP_DIR/common/regex-partial.cpp"
+# Removed upstream; CMakeLists globs common/*.cpp, so a stale copy would build.
+rm -f "$CPP_DIR/common/json-partial.h" "$CPP_DIR/common/json-partial.cpp"
+rm -f "$CPP_DIR/common/regex-partial.h" "$CPP_DIR/common/regex-partial.cpp"
 cp "$LLAMA_DIR/common/chat.h"                         "$CPP_DIR/common/chat.h"
 cp "$LLAMA_DIR/common/chat.cpp"                       "$CPP_DIR/common/chat.cpp"
 cp "$LLAMA_DIR/common/chat-auto-parser.h"             "$CPP_DIR/common/chat-auto-parser.h"
@@ -445,6 +451,7 @@ echo "==> Applying LM_ prefix rewrites..."
 
 files_add_lm_prefix=(
   "$CPP_DIR/ggml-opencl/"*.cpp
+  "$CPP_DIR/ggml-opencl/"*.h
 
   # Vulkan backend (ggml-vulkan.cpp and its header)
   "$CPP_DIR/ggml-vulkan/ggml-vulkan.cpp"
