@@ -49,9 +49,11 @@ void llama_rn_context_completion::rewind() {
     num_tokens_predicted = 0;
     num_draft_tokens = 0;
     num_draft_tokens_accepted = 0;
+    resetGenerationTimings();
     prefill_text = "";
     generated_text = "";
     generated_text.reserve(parent_ctx->params.n_ctx);
+    utf8_gate.reset();
     truncated = false;
     context_full = false;
     stopped_eos = false;
@@ -235,6 +237,7 @@ void llama_rn_context_completion::beginCompletion(int chat_format, common_reason
     // number of tokens to keep when resetting context
     n_remain = parent_ctx->params.n_predict;
     llama_perf_context_reset(parent_ctx->ctx);
+    resetGenerationTimings();
     is_predicting = true;
 
     current_chat_format = chat_format;
@@ -244,7 +247,31 @@ void llama_rn_context_completion::beginCompletion(int chat_format, common_reason
 }
 
 void llama_rn_context_completion::endCompletion() {
+    generated_text += utf8_gate.finish();
+    incomplete = false;
+    // Trim the undecoded final token. On a stop-word / token-budget stop the last
+    // sampled token is already pushed to embd but never decoded.
+    if (n_past > 0 && n_past < (llama_pos) embd.size()) {
+        embd.resize(n_past);
+    }
     is_predicting = false;
+}
+
+void llama_rn_context_completion::resetGenerationTimings() {
+    t_start_generation = 0;
+    t_token_generation = 0.0;
+}
+
+void llama_rn_context_completion::startGenerationTiming() {
+    if (t_start_generation == 0) {
+        t_start_generation = lm_ggml_time_us();
+    }
+}
+
+void llama_rn_context_completion::updateGenerationTiming() {
+    if (t_start_generation != 0 && num_tokens_predicted > 0) {
+        t_token_generation = (lm_ggml_time_us() - t_start_generation) / 1e6;
+    }
 }
 
 bool llama_rn_context_completion::shouldUseMTP() const {
@@ -313,6 +340,7 @@ void llama_rn_context_completion::initMTP() {
     n_past = 0;
 
     evalMTPPrompt();
+    startGenerationTiming();
 }
 
 void llama_rn_context_completion::evalMTPPrompt() {
@@ -493,6 +521,7 @@ completion_token_output llama_rn_context_completion::nextTokenMTP() {
     if (spec == nullptr) {
         initMTP();
     }
+    startGenerationTiming();
 
     if (spec_pending_tokens.empty() && !refillMTPTokens()) {
         return result;
@@ -501,6 +530,7 @@ completion_token_output llama_rn_context_completion::nextTokenMTP() {
     result = std::move(spec_pending_tokens.front());
     spec_pending_tokens.pop_front();
     num_tokens_predicted++;
+    updateGenerationTiming();
     has_next_token = !spec_pending_tokens.empty() || (!stopped_eos && !stopped_limit && !context_full);
     return result;
 }
@@ -604,6 +634,8 @@ completion_token_output llama_rn_context_completion::nextToken()
         return result;
     }
 
+    startGenerationTiming();
+
     {
         // out of user input, sample next token
         std::vector<llama_token_data> candidates;
@@ -640,6 +672,7 @@ completion_token_output llama_rn_context_completion::nextToken()
         common_sampler_accept(ctx_sampling, result.tok, true);
         if (tg) {
             num_tokens_predicted++;
+            updateGenerationTiming();
         }
     }
 
@@ -689,7 +722,7 @@ completion_token_output llama_rn_context_completion::doCompletion()
     completion_token_output token_with_probs = nextToken();
 
     const std::string token_text = token_with_probs.tok == -1 ? "" : common_token_to_piece(parent_ctx->ctx, token_with_probs.tok);
-    generated_text += token_text;
+    generated_text += utf8_gate.feed(token_text);
 
     if (parent_ctx->isVocoderEnabled()) {
         tts_type type = parent_ctx->tts_wrapper->getTTSType(parent_ctx);
@@ -706,26 +739,7 @@ completion_token_output llama_rn_context_completion::doCompletion()
         generated_token_probs.push_back(token_with_probs);
     }
 
-    // check if there is incomplete UTF-8 character at the end
-    for (unsigned i = 1; i < 5 && i <= generated_text.size(); ++i) {
-        unsigned char c = generated_text[generated_text.size() - i];
-        if ((c & 0xC0) == 0x80) {
-            // continuation byte: 10xxxxxx
-            continue;
-        }
-        if ((c & 0xE0) == 0xC0) {
-            // 2-byte character: 110xxxxx ...
-            incomplete = i < 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            // 3-byte character: 1110xxxx ...
-            incomplete = i < 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            // 4-byte character: 11110xxx ...
-            incomplete = i < 4;
-        }
-        // else 1-byte character or invalid byte
-        break;
-    }
+    incomplete = utf8_gate.has_pending();
 
     if (incomplete && !has_next_token)
     {
