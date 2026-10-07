@@ -18,6 +18,13 @@ data class ChatMessage(val role: String, val content: String)
  *   cumulative probability reaches P. 1.0 disables the filter. Default 0.95.
  * [minP] — drop tokens whose probability is below minP times the top
  *   token's probability. 0 disables the filter. Default 0.05.
+ * [repeatPenalty]: multiplicative penalty on tokens already generated in this
+ *   completion (llama.cpp `penalty_repeat`). 1.0 disables it (default, no behaviour
+ *   change). Applied first in the sampler chain, before topK/topP/minP/temperature.
+ *   Its window only holds tokens the sampler accepted: generated tokens, reasoning
+ *   included, never the prompt.
+ * [repeatLastN]: how many of the most recent generated tokens the penalty looks
+ *   at (`penalty_last_n`). 0 or negative disables (this build clamps -1 to 0). Default 64.
  * [stopSequences] — strings that end generation when they appear in the
  *   output. The matched sequence is not emitted (partial matches are held
  *   back until resolved), so the stream stays clean.
@@ -40,6 +47,8 @@ data class SamplingParams(
     val minP: Float = 0.05f,
     val stopSequences: List<String> = emptyList(),
     val reasoningBudgetTokens: Int = -1,
+    val repeatPenalty: Float = 1.0f,
+    val repeatLastN: Int = 64,
 )
 
 /**
@@ -283,6 +292,7 @@ class LlamaEngine {
         handle, prompt,
         params.nPredict, params.reasoningBudgetTokens,
         params.temperature, params.topK, params.topP, params.minP,
+        params.repeatPenalty, params.repeatLastN,
         params.stopSequences.toTypedArray(),
         callback,
         chatParseCallback,
@@ -325,6 +335,7 @@ class LlamaEngine {
         h: Long, prompt: String,
         nPredict: Int, reasoningBudgetTokens: Int,
         temperature: Float, topK: Int, topP: Float, minP: Float,
+        repeatPenalty: Float, repeatLastN: Int,
         stopSequences: Array<String>,
         cb: TokenCallback,
         cbChat: ChatParseCallback?,

@@ -149,6 +149,32 @@ void llama_rn_context_completion::loadPrompt(const std::vector<std::string> &med
         // compare the evaluated prompt with the new prompt
         n_past = is_enc_dec ? 0 : find_common_prefix_length(embd, text_tokens);
 
+        // The KV cache is the source of truth for what is cached, embd only
+        // says what we think is in it. They disagree after an aborted or failed
+        // decode (embd was set to the whole prompt before anything was decoded),
+        // and trusting embd then reuses cells that were never computed (TEN-114).
+        // seq_pos_max is -1 on an empty sequence, so this is 0 then.
+        if (n_past > 0) {
+            auto * kv_check = llama_get_memory(parent_ctx->ctx);
+            const llama_pos n_kv = llama_memory_seq_pos_max(kv_check, 0) + 1;
+            if (n_kv < n_past) {
+                LOG_WARNING("embd claims %d cached tokens but the KV holds %d, trusting the KV", n_past, n_kv);
+                n_past = n_kv;
+            }
+            // SWA caches (Gemma-4 is iSWA, swa_full defaults to false) overwrite cells
+            // older than the window, so a prefix longer than what the window still
+            // holds would reuse missing cells. Same guard as llama.cpp server:
+            // if the oldest cell is past what the reused prefix needs, re-prefill.
+            const int32_t n_swa = llama_model_n_swa(parent_ctx->model);
+            if (n_swa > 0) {
+                const llama_pos pos_min = llama_memory_seq_pos_min(kv_check, 0);
+                if (pos_min > std::max<llama_pos>(0, n_past - n_swa)) {
+                    LOG_WARNING("SWA cache starts at pos %d, reuse of %d tokens would hit evicted cells (n_swa=%d), full re-prefill", pos_min, n_past, n_swa);
+                    n_past = 0;
+                }
+            }
+        }
+
         embd = text_tokens;
         if (n_past == num_prompt_tokens) {
             // we have to evaluate at least 1 token to generate logits.
@@ -600,9 +626,14 @@ completion_token_output llama_rn_context_completion::nextToken()
                 // stays at the value from before this llama_decode() call, which
                 // matches or undershoots what's actually committed (a prior
                 // ubatch inside the same call may have completed and stayed
-                // committed even though n_past isn't bumped for it). That's safe,
-                // not stale-corrupt: the next completion resumes from n_past and
-                // will simply recompute/overwrite those positions.
+                // committed even though n_past isn't bumped for it).
+                // embd, however, still holds the whole prompt (loadPrompt() sets
+                // it before anything is decoded) and the next loadPrompt() takes
+                // its common prefix with the new prompt from embd, NOT from
+                // n_past: left as is it would trust cells that were never
+                // decoded (TEN-114). Trimmed to n_past below, the harmless
+                // direction: the next loadPrompt() seq_rm()s whatever
+                // undeclared cells remain and recomputes those positions.
                 LOG_INFO("Decoding Interrupted mid-eval (n_past: %d, n_eval: %d)", n_past, n_eval);
             } else {
                 LOG_ERROR("failed to eval, n_eval: %d, n_past: %d, n_threads: %d, embd: %s",
@@ -611,6 +642,10 @@ completion_token_output llama_rn_context_completion::nextToken()
                     parent_ctx->params.cpuparams.n_threads,
                     tokens_to_str(parent_ctx->ctx, embd.cbegin() + n_past, embd.cend()).c_str()
                 );
+            }
+            // Invariant: embd never runs ahead of the KV (n_past) when we leave.
+            if (n_past < (llama_pos) embd.size()) {
+                embd.resize(n_past);
             }
             has_next_token = false;
             return result;

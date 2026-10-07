@@ -154,6 +154,8 @@ data class SamplingParams(
     val topP: Float = 0.95f,       // 1.0 = disabled
     val minP: Float = 0.05f,       // 0 = disabled
     val stopSequences: List<String> = emptyList(),  // never emitted to the stream
+    val repeatPenalty: Float = 1.0f,  // 1.0 = disabled; generated tokens only, applied before top_k/top_p/min_p/temp
+    val repeatLastN: Int = 64,       // window for repeatPenalty (0 or negative = off)
 )
 
 data class ChatMessage(val role: String, val content: String)

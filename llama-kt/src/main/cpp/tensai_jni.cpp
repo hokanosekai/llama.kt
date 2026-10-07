@@ -933,7 +933,20 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // a decode that was cut off mid-sentence. Zero on every early exit: nothing
 // was generated.
 
+// Invariant (TEN-114, generalising TEN-92): whenever a completion or a prefill
+// is left, for any reason, embd holds exactly the tokens decoded into seq 0 of
+// the KV, ie n_past. Anything beyond it is a sampled-but-undecoded last token
+// or an aborted prompt tail, and the next loadPrompt() would take its common
+// prefix over cells that do not exist. Trimming is the harmless direction: the
+// next loadPrompt() seq_rm()s whatever undeclared cells remain.
+static void trim_embd_to_n_past(rnllama::llama_rn_context_completion* comp) {
+    if (comp->n_past < static_cast<llama_pos>(comp->embd.size())) {
+        comp->embd.resize(static_cast<size_t>(comp->n_past));
+    }
+}
+
 static jint completion_impl(
+        bool&   prompt_started,
         JNIEnv* env,
         jlong   h,
         jstring prompt,
@@ -943,6 +956,8 @@ static jint completion_impl(
         jint    topK,
         jfloat  topP,
         jfloat  minP,
+        jfloat  repeatPenalty,
+        jint    repeatLastN,
         jobjectArray stopSequences,
         jobject cb,
         jobject cbChat)
@@ -987,10 +1002,16 @@ static jint completion_impl(
     rnctx->params.sampling.top_k = static_cast<int32_t>(topK);
     rnctx->params.sampling.top_p = static_cast<float>(topP);
     rnctx->params.sampling.min_p = static_cast<float>(minP);
-    LOGI("nativeCompletion: n_predict=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f",
+    // penalty_repeat 1.0 = disabled. The penalties sampler is first in the chain (before
+    // top_k/top_p/min_p/temp) and its window only sees tokens the sampler accepted, ie the
+    // generated ones (reasoning included), not the prompt. llama.cpp semantics, kept as is.
+    rnctx->params.sampling.penalty_repeat = static_cast<float>(repeatPenalty);
+    rnctx->params.sampling.penalty_last_n = static_cast<int32_t>(repeatLastN);
+    LOGI("nativeCompletion: n_predict=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f repeat_penalty=%.2f last_n=%d",
          rnctx->params.n_predict, rnctx->params.sampling.temp,
          rnctx->params.sampling.top_k, rnctx->params.sampling.top_p,
-         rnctx->params.sampling.min_p);
+         rnctx->params.sampling.min_p, rnctx->params.sampling.penalty_repeat,
+         rnctx->params.sampling.penalty_last_n);
 
     auto* comp = rnctx->completion;
     comp->rewind();  // clears params.antiprompt — set stop sequences after this
@@ -1083,6 +1104,10 @@ static jint completion_impl(
     }
 
     // Tokenise and load prompt (no media)
+    // From here embd is rewritten, so the end-of-completion trim applies. Before it
+    // (early exits after rewind()) embd still describes the warm cache and n_past
+    // is a meaningless 0: trimming then would wipe a valid cache.
+    prompt_started = true;
     comp->loadPrompt({});
 
     // TEN-47: hand the chat format / reasoning format / generation prompt /
@@ -1266,6 +1291,11 @@ static jint completion_impl(
         emit_parse(/* is_partial */ comp->is_interrupted);
     }
 
+    // Whatever ended the loop (EOS, stop word, n_predict, interrupt, decode
+    // error), embd must not claim more than the KV holds. endCompletion() is
+    // never called from here, and it skips n_past == 0 anyway.
+    if (!comp->context_full) trim_embd_to_n_past(comp);
+
     env->DeleteLocalRef(cbClass);
     if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
 
@@ -1287,6 +1317,8 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
         jint    topK,
         jfloat  topP,
         jfloat  minP,
+        jfloat  repeatPenalty,
+        jint    repeatLastN,
         jobjectArray stopSequences,
         jobject cb,
         jobject cbChat)
@@ -1302,14 +1334,22 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
     // A negative count is not a count at all, so it cannot be mistaken for one.
     // LlamaKtEngineImpl.decode() turns it into a DecodeEvent.Error, the same
     // terminal event an OOM or a Kotlin-side exception produces.
+    bool prompt_started = false;
     return jni_guard("nativeCompletion",
                      [&] {
-                         return completion_impl(env, h, prompt, nPredict,
+                         return completion_impl(prompt_started, env, h, prompt, nPredict,
                                                 reasoningBudgetTokens, temperature,
-                                                topK, topP, minP, stopSequences,
+                                                topK, topP, minP,
+                                                repeatPenalty, repeatLastN, stopSequences,
                                                 cb, cbChat);
                      },
-                     [] { return (jint) -1; });
+                     [&] {
+                         if (prompt_started && h != 0L && to_ctx(h)->completion != nullptr
+                             && !to_ctx(h)->completion->context_full) {
+                             trim_embd_to_n_past(to_ctx(h)->completion);
+                         }
+                         return (jint) -1;
+                     });
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,12 +1437,6 @@ struct scoped_n_batch {
         : rnctx(c), saved(c->params.n_batch) { c->params.n_batch = std::min(saved, n); }
     ~scoped_n_batch() { rnctx->params.n_batch = saved; }
 };
-
-static void trim_embd_to_n_past(rnllama::llama_rn_context_completion* comp) {
-    if (comp->n_past < static_cast<llama_pos>(comp->embd.size())) {
-        comp->embd.resize(static_cast<size_t>(comp->n_past));
-    }
-}
 
 static jint prefill_impl(
         JNIEnv* env,
@@ -1725,10 +1759,11 @@ static jint saveSession_impl(
     //   or by n_predict      — one token: the last one is sampled and pushed,
     //                          and generation stops before it is ever decoded
     //   aborted mid-graph    — everything left to decode, up to a whole prompt
-    //     (decode_ret == 2)    on a cancelled prefill: that branch advances
-    //                          neither n_past nor embd, unlike the
-    //                          is_interrupted branch below it which resizes
-    //                          embd back down to n_past
+    //     (decode_ret == 2)    on a cancelled prefill. Since TEN-114 nextToken()
+    //                          trims embd to n_past on that branch (and on a
+    //                          decode error), and completion_impl() trims at
+    //                          the end of every completion, so this clamp is now
+    //                          a safety net rather than the only guard
     //
     // Saving the larger number is what corrupts the restore. nativeLoadSession
     // sets n_past = N from the file while the cache holds N-1 cells; the next
@@ -1754,6 +1789,12 @@ static jint saveSession_impl(
                  n_tokens, n_cached, n_cached);
             n_tokens = n_cached;
         } else if (n_cached > n_tokens) {
+            if (rnctx->completion->shouldUseMTP()) {
+                // MTP speculation advances n_past (= spec_n_past) over the
+                // accepted tokens but keeps embd prompt-only, by design. The
+                // file then describes the prompt; the extra cells are dropped
+                // by the next loadPrompt() seq_rm(n_past, -1). Not a defect.
+            } else {
             // Never observed and no path in rn-completion.cpp produces it:
             // loadPrompt() derives n_past from a prefix of embd, the context
             // shift drops the same count from both, and nativeLoadSession sets
@@ -1762,6 +1803,7 @@ static jint saveSession_impl(
             // one. Saving embd->size() is the conservative read either way.
             LOGE("nativeSaveSession: n_past=%zu exceeds embd=%zu — token list is "
                  "behind the KV cache, saving %zu", n_cached, n_tokens, n_tokens);
+            }
         }
     }
 
