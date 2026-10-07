@@ -288,6 +288,28 @@ class LlamaEngine {
         chatParseCallback,
     )
 
+    /**
+     * Decode [prompt] into the KV cache without generating anything, [completion] up to
+     * and including its prefill, and not a token further. Blocking, like [completion]: it
+     * holds the calling thread for as long as the prefill takes (minutes, for a long
+     * prompt on a phone), and [interrupt] ends it between chunks.
+     *
+     * Goes through the same prefix reuse as [completion]: whatever the cache already holds
+     * of [prompt]'s leading tokens is kept, the rest is dropped and decoded. The cache is
+     * then bookkept as a completion would have left it, so a [completion] that follows with
+     * a prompt starting with [prompt] reuses all of it, which is the point, see
+     * `nativePrefill` in `tensai_jni.cpp` for why a caller wants that.
+     *
+     * An interrupted prefill keeps the chunks it finished: the cache holds a valid prefix of
+     * [prompt] and [kvUsed] says how long.
+     *
+     * @return how many tokens the cache holds afterwards ([kvUsed]), also when interrupted.
+     *   `0` when the prompt was declined without touching the cache (it does not fit the
+     *   context window, or the model is encoder-decoder). **Negative means the native side
+     *   failed**; the cache is still consistent, with whatever was decoded before the failure.
+     */
+    fun prefill(prompt: String): Int = nativePrefill(handle, prompt)
+
     // ------------------------------------------------------------------
     // JNI declarations — names and types must match tensai_jni.cpp exactly
     // ------------------------------------------------------------------
@@ -307,6 +329,7 @@ class LlamaEngine {
         cb: TokenCallback,
         cbChat: ChatParseCallback?,
     ): Int
+    private external fun nativePrefill(h: Long, prompt: String): Int
     private external fun nativeFormatChat(h: Long, messagesJson: String, enableThinking: Boolean): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int

@@ -2,7 +2,7 @@
  * tensai_jni.cpp — JNI bridge for com.tensai.llamakt.LlamaEngine
  *
  * Entry points:
- *   nativeLoadModel, nativeFree, nativeCompletion,
+ *   nativeLoadModel, nativeFree, nativeCompletion, nativePrefill,
  *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
  *   nativeInterrupt, nativeSaveSession, nativeLoadSession,
  *   nativeListBackends, nativeActiveBackend,
@@ -1310,6 +1310,162 @@ Java_com_tensai_llamakt_LlamaEngine_nativeCompletion(
                                                 cb, cbChat);
                      },
                      [] { return (jint) -1; });
+}
+
+// ---------------------------------------------------------------------------
+// nativePrefill (TEN-88)
+// ---------------------------------------------------------------------------
+// Decodes `prompt` into the KV cache and stops there: no sampling, no token
+// callback, nothing generated. It is what nativeCompletion() does for its
+// prompt, minus everything after it, and it goes through the very same
+// rewind() + loadPrompt() pair on purpose: that is where embd / n_past are
+// derived from the common prefix with whatever the cache already holds, so a
+// cache filled here is bookkept exactly like one filled by a completion, and
+// the next real completion reuses it through the same find_common_prefix_length.
+//
+// Why it exists: the app re-sends the whole history every turn, and the chat
+// template renders past assistant turns differently from what the model
+// generated (reasoning dropped, empty think block not replayed). The cache
+// therefore diverges from the next prompt at the start of the last reply, and
+// the whole reply is re-prefilled before the first token of the next turn
+// (292 s measured on a 1965-token reply). The app uses this to rewrite that
+// part of the cache into the form the next prompt will have, while the user is
+// still reading.
+//
+// How it stops decoding: nextToken() decodes `while (n_past < embd.size())`
+// *before* it looks at n_predict, and with n_predict == 0 it then returns
+// without sampling and without pushing a token onto embd. So the whole prefill
+// is one nextToken() call and there is no decode loop to duplicate here. It is run
+// with n_batch lowered to PREFILL_CHUNK_TOKENS so that an interrupt keeps all the
+// chunks already decoded.
+//
+// Interruption: the same is_interrupted flag as a completion (nativeInterrupt),
+// checked between n_batch chunks and, on the CPU backend, between graph nodes.
+// rewind() clears the flag on entry, so a caller must not interrupt *before*
+// this is entered and expect it to stick (same window nativeCompletion has).
+//
+// TEN-92's invariant, restated for this entry point: embd must never be ahead
+// of n_past when this returns, whatever the way out. Three ways out leave it
+// ahead, none of them by anything nextToken() does wrong:
+//   - decode_ret == 2 (aborted mid-graph): nextToken() advances neither n_past
+//     nor embd, so embd still holds the whole prompt over a cache that holds
+//     less, possibly nothing. Trimmed below. endCompletion() would not do it
+//     (it skips n_past == 0), and the next loadPrompt() would take the common
+//     prefix of an embd that over-declares the cache.
+//   - a real decode failure: same shape.
+//   - a C++ exception: the jni_guard fallback trims too.
+// Trimming to n_past is the harmless direction (the next loadPrompt's
+// seq_rm(n_past, -1) drops whatever undeclared cells remain), and it keeps
+// every chunk that did complete: an interrupted warm-up leaves a usable prefix.
+//
+// Declines (returns 0, touches nothing, not even rewind()) when the prompt
+// would not fit: loadPrompt() would truncate it or flag context_full and leave
+// n_past at 0 over a populated cache, a state a warm-up has no business
+// creating. Also declines encoder-decoder models (their prefill is a separate
+// encode phase this does not model) and MTP speculation (nextToken() takes
+// another path there).
+//
+// Returns n_past, the number of tokens now resident, which is also the count a
+// following nativeSaveSession would write. -1 on failure.
+
+// How many tokens one llama_decode() of a prefill covers (TEN-88). It is the
+// abort granularity: an interrupt is only honoured between llama_decode()
+// calls, or inside one by the CPU abort callback, and an abort *inside* a call
+// rolls back the whole ubatch in flight (llama_decode erases its cells and
+// returns 2, and nextToken() then leaves n_past where it was). With the
+// default n_batch a reply shorter than one ubatch is a single graph, so an
+// interrupted warm-up kept nothing: measured on device, 147 tokens, aborted
+// after 22 s, all lost, and the next turn re-decoded them.
+//
+// nextToken() sizes each call as min(remaining, params.n_batch) and
+// llama_decode() splits a call into ubatches of at most n_ubatch, so setting
+// n_batch to this bounds the ubatch (128 <= n_ubatch, any n_ubatch worth
+// having) and an interrupt costs at most this chunk. The price is throughput:
+// smaller graphs amortise the weight reads over fewer tokens, which on a CPU
+// is a few percent to low tens of percent against one 512-wide ubatch (to be
+// measured on device, the warm-up is background work and a bounded interrupt
+// cost is worth that).
+static constexpr int32_t PREFILL_CHUNK_TOKENS = 128;
+
+// Sets params.n_batch for the lifetime of the object and puts it back on every
+// way out, the jni_guard fallback included (a C++ exception unwinds through
+// the destructor): a normal completion must keep its own n_batch.
+struct scoped_n_batch {
+    rnllama::llama_rn_context* rnctx;
+    int32_t saved;
+    scoped_n_batch(rnllama::llama_rn_context* c, int32_t n)
+        : rnctx(c), saved(c->params.n_batch) { c->params.n_batch = std::min(saved, n); }
+    ~scoped_n_batch() { rnctx->params.n_batch = saved; }
+};
+
+static void trim_embd_to_n_past(rnllama::llama_rn_context_completion* comp) {
+    if (comp->n_past < static_cast<llama_pos>(comp->embd.size())) {
+        comp->embd.resize(static_cast<size_t>(comp->n_past));
+    }
+}
+
+static jint prefill_impl(
+        JNIEnv* env,
+        jlong   h,
+        jstring prompt)
+{
+    if (h == 0L) return -1;
+    auto* rnctx = to_ctx(h);
+    auto* comp = rnctx->completion;
+    if (comp == nullptr || rnctx->ctx == nullptr) {
+        LOGE("nativePrefill: completion context is null");
+        return -1;
+    }
+    if (llama_model_has_encoder(rnctx->model) || comp->shouldUseMTP()) {
+        LOGI("nativePrefill: declined, encoder-decoder / MTP model");
+        return 0;
+    }
+
+    const std::string text = jstring_to_std(env, prompt);
+    {
+        // +1 for the BOS loadPrompt() may add on top of this count.
+        const size_t n_tokens = rnctx->tokenize(text, {}).tokens.size();
+        if (n_tokens + 1 >= static_cast<size_t>(rnctx->n_ctx)) {
+            LOGI("nativePrefill: declined, %zu tokens do not fit n_ctx=%d", n_tokens, rnctx->n_ctx);
+            return 0;
+        }
+    }
+
+    rnctx->params.prompt = text;
+    rnctx->params.n_predict = 0;  // read by nextToken(): decode the prompt, sample nothing
+    comp->rewind();
+    comp->loadPrompt({});  // logs "Input processed: n_past=..." like a completion does
+
+    const size_t target = comp->embd.size();
+    // Restored when this function is left, however it is left. See PREFILL_CHUNK_TOKENS.
+    scoped_n_batch chunking(rnctx, PREFILL_CHUNK_TOKENS);
+    comp->nextToken();
+    comp->has_next_token = false;
+    const bool complete = comp->n_past >= static_cast<llama_pos>(target);
+    trim_embd_to_n_past(comp);
+
+    LOGI("nativePrefill: n_past=%d of %zu tokens (interrupted=%d)",
+         comp->n_past, target, comp->is_interrupted ? 1 : 0);
+    // An interrupt is an answer, not a failure: the prefix that did land stays.
+    if (!complete && !comp->is_interrupted) return -1;
+    return static_cast<jint>(comp->n_past);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativePrefill(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h,
+        jstring prompt)
+{
+    return jni_guard("nativePrefill",
+                     [&] { return prefill_impl(env, h, prompt); },
+                     [&] {
+                         if (h != 0L && to_ctx(h)->completion != nullptr) {
+                             trim_embd_to_n_past(to_ctx(h)->completion);
+                         }
+                         return (jint) -1;
+                     });
 }
 
 // ---------------------------------------------------------------------------
