@@ -728,7 +728,20 @@ struct common_params {
     // return false from callback to abort model loading or true to continue
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
+    // optional callback for coarse load stages (tensai): fired by common_init_from_params when it moves
+    // from reading weights to creating the context (KV cache + compute graph reservation) and then to
+    // the warmup decode. Stage ids are the common_load_stage values.
+    void (*load_stage_callback)(int stage, void * user_data) = NULL;
+    void *                  load_stage_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+};
+
+// Load stages reported through common_params::load_stage_callback. Values are mirrored by
+// LoadStage in LlamaEngine.kt, keep them in sync.
+enum common_load_stage : int {
+    COMMON_LOAD_STAGE_WEIGHTS = 0,
+    COMMON_LOAD_STAGE_CONTEXT = 1,
+    COMMON_LOAD_STAGE_WARMUP  = 2,
 };
 
 // call once at the start of a program if it uses libcommon

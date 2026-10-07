@@ -1230,6 +1230,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? LM_GGML_LOG_LEVEL_DEBUG : LM_GGML_LOG_LEVEL_ERROR);
     }
 
+    // After common_fit_params above: that step probes the model without reading the weights,
+    // so it is not "reading weights" yet (the stage means onProgress is about to start).
+    if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_WEIGHTS, params.load_stage_callback_user_data);
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1309,6 +1312,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
+
+    if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_CONTEXT, params.load_stage_callback_user_data);
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
@@ -1420,6 +1425,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
+        if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_WARMUP, params.load_stage_callback_user_data);
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;

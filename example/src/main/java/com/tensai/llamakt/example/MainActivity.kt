@@ -781,9 +781,13 @@ class MainActivity : ComponentActivity() {
                                             status = "Loading model (nGpuLayers=$nGpuLayers, threads=${if (nThreads == 0) "auto" else nThreads})…"
                                             withContext(Dispatchers.IO) {
                                                 engine.load(path, nGpuLayers, nCtx, nThreads,
-                                                    LoadProgressCallback { p ->
-                                                        status = "Loading model… ${(p * 100).toInt()}%"
-                                                        true
+                                                    object : LoadProgressCallback {
+                                                        override fun onProgress(progress: Float): Boolean {
+                                                            status = "Loading model… ${(progress * 100).toInt()}%"
+                                                            return true
+                                                        }
+
+                                                        override fun onStage(stage: Int) = Unit
                                                     },
                                                     kvCacheType, flashAttn)
                                             }
@@ -1049,9 +1053,13 @@ class MainActivity : ComponentActivity() {
                                                 status = "Loading model…"
                                                 withContext(Dispatchers.IO) {
                                                     engine.load(path, nGpuLayers, nCtx, nThreads,
-                                                        LoadProgressCallback { p ->
-                                                            status = "Loading model… ${(p * 100).toInt()}%"
-                                                            true
+                                                        object : LoadProgressCallback {
+                                                            override fun onProgress(progress: Float): Boolean {
+                                                                status = "Loading model… ${(progress * 100).toInt()}%"
+                                                                return true
+                                                            }
+
+                                                            override fun onStage(stage: Int) = Unit
                                                         },
                                                         kvCacheType)
                                                 }

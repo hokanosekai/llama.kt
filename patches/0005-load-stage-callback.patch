@@ -1,0 +1,58 @@
+diff --git a/llama-kt/src/main/cpp/common/common.cpp b/llama-kt/src/main/cpp/common/common.cpp
+index c6fa8e8..f37ac68 100644
+--- a/llama-kt/src/main/cpp/common/common.cpp
++++ b/llama-kt/src/main/cpp/common/common.cpp
+@@ -1230,6 +1230,9 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.verbosity >= LOG_LEVEL_DEBUG ? LM_GGML_LOG_LEVEL_DEBUG : LM_GGML_LOG_LEVEL_ERROR);
+     }
+ 
++    // After common_fit_params above: that step probes the model without reading the weights,
++    // so it is not "reading weights" yet (the stage means onProgress is about to start).
++    if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_WEIGHTS, params.load_stage_callback_user_data);
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+     if (model == NULL) {
+         return;
+@@ -1310,6 +1313,8 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
++    if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_CONTEXT, params.load_stage_callback_user_data);
++
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+@@ -1420,6 +1425,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+     }
+ 
+     if (params.warmup) {
++        if (params.load_stage_callback) params.load_stage_callback(COMMON_LOAD_STAGE_WARMUP, params.load_stage_callback_user_data);
+         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+ 
+         std::vector<llama_token> tmp;
+diff --git a/llama-kt/src/main/cpp/common/common.h b/llama-kt/src/main/cpp/common/common.h
+index 231e3a0..3d81d17 100644
+--- a/llama-kt/src/main/cpp/common/common.h
++++ b/llama-kt/src/main/cpp/common/common.h
+@@ -728,9 +728,22 @@ struct common_params {
+     // return false from callback to abort model loading or true to continue
+     llama_progress_callback load_progress_callback = NULL;
+     void *                  load_progress_callback_user_data = NULL;
++    // optional callback for coarse load stages (tensai): fired by common_init_from_params when it moves
++    // from reading weights to creating the context (KV cache + compute graph reservation) and then to
++    // the warmup decode. Stage ids are the common_load_stage values.
++    void (*load_stage_callback)(int stage, void * user_data) = NULL;
++    void *                  load_stage_callback_user_data = NULL;
+     bool no_alloc = false; // Don't allocate model buffers
+ };
+ 
++// Load stages reported through common_params::load_stage_callback. Values are mirrored by
++// LoadStage in LlamaEngine.kt, keep them in sync.
++enum common_load_stage : int {
++    COMMON_LOAD_STAGE_WEIGHTS = 0,
++    COMMON_LOAD_STAGE_CONTEXT = 1,
++    COMMON_LOAD_STAGE_WARMUP  = 2,
++};
++
+ // call once at the start of a program if it uses libcommon
+ // initializes the logging system and prints info about the build
+ void common_init();

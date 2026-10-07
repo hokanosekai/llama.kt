@@ -218,7 +218,10 @@ The native engine mirrors llama.rn's `cpp/rn-llama.*`, `rn-completion.*`, `rn-mt
 **Both upstreams are pinned.** llama.cpp by its submodule sha, llama.rn by `scripts/llama.rn.rev` — a `--depth 1` clone of a moving default branch used to decide what landed in `cpp/`, so two runs a fortnight apart produced different sources with nothing in the repo to say which. `bootstrap.sh` now checks out that sha and aborts if the checkout doesn't match or has been edited in place. The two pins are coupled: the inherited `scripts/patches/` are written against llama.rn's own llama.cpp submodule, so bumping one without the other makes those patches fail — which is now fatal, not a warning. Bump them together.
 
 **Local patches on vendored code** live in [`patches/`](patches/) and are applied automatically at the end of `bootstrap.sh`. Unlike the inherited llama.rn patches, a local patch that no longer applies aborts the bootstrap — after a submodule bump, update the patch deliberately instead of losing the fix silently. Current patches:
+- `0002-abort-callback-mid-graph-cancel.patch`: ggml abort callback checked per graph node, so cancelling a long prefill does not wait for the whole batch (TEN-17). Targets `rn-llama.cpp`, `rn-completion.h`, `rn-completion.cpp`.
 - `0003-vulkan-device-dispatcher-init.patch`: loads device-level Vulkan function pointers after `createDevice` (the Android loader only fills instance-level ones), and turns off `buffer_device_address` when the driver advertises it without exposing `vkGetBufferDeviceAddress` (Mali).
+- `0004-stale-embd-kv-invariant.patch`: `rn-completion.cpp` never trusts KV cells that were not decoded (embd vs KV position check, SWA window guard, embd trimmed on abort) (TEN-114).
+- `0005-load-stage-callback.patch`: `common.{h,cpp}` gain `common_params::load_stage_callback`, fired at WEIGHTS / CONTEXT / WARMUP inside `common_init_from_params`; `tensai_jni.cpp` turns it into `LoadProgressCallback.onStage` (TEN-123).
 
 ## Roadmap
 

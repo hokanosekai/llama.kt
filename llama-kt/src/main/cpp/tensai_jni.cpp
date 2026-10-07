@@ -779,7 +779,27 @@ struct LoadProgressHolder {
     JNIEnv*   env;
     jobject   cb;
     jmethodID onProgress;
+    jmethodID onStage;   // nullptr when the callback predates stages: no stage events
 };
+
+// Stage ids sent to LoadProgressCallback.onStage. Values 0..2 are common_load_stage
+// (common.h); READY is ours, emitted once nativeLoadModel has a usable context.
+// Mirrored by LoadStage in LlamaEngine.kt, keep them in sync.
+static constexpr int LOAD_STAGE_READY = 3;
+
+static void emit_load_stage(LoadProgressHolder* h, int stage) {
+    if (h == nullptr || h->onStage == nullptr) return;
+    h->env->CallVoidMethod(h->cb, h->onStage, (jint) stage);
+    if (h->env->ExceptionCheck()) {
+        // A stage is informational: a throwing listener must not fail the load.
+        h->env->ExceptionClear();
+        LOGE("load stage callback threw, ignored");
+    }
+}
+
+static void load_stage_trampoline(int stage, void* user_data) {
+    emit_load_stage(static_cast<LoadProgressHolder*>(user_data), stage);
+}
 
 static bool load_progress_trampoline(float progress, void* user_data) {
     auto* h = static_cast<LoadProgressHolder*>(user_data);
@@ -849,15 +869,31 @@ static jlong loadModel_impl(
         holder.env = env;
         holder.cb = progressCb;
         holder.onProgress = env->GetMethodID(cbClass, "onProgress", "(F)Z");
+        if (holder.onProgress == nullptr) env->ExceptionClear();
         if (holder.onProgress != nullptr) {
             p.load_progress_callback = load_progress_trampoline;
             p.load_progress_callback_user_data = &holder;
         } else {
             LOGE("loadModel: onProgress(F)Z not found, progress disabled");
         }
+        // Optional, like onProgress: a callback implementation without onStage(I)V just gets
+        // no stage events. The failed lookup leaves a NoSuchMethodError pending, clear it.
+        holder.onStage = env->GetMethodID(cbClass, "onStage", "(I)V");
+        if (holder.onStage != nullptr) {
+            p.load_stage_callback = load_stage_trampoline;
+            p.load_stage_callback_user_data = &holder;
+        } else {
+            env->ExceptionClear();
+        }
     }
 
     const bool ok = rnctx->loadModel(p);
+    // rnctx keeps a copy of p: drop the pointers into this stack frame.
+    rnctx->params.load_progress_callback = nullptr;
+    rnctx->params.load_progress_callback_user_data = nullptr;
+    rnctx->params.load_stage_callback = nullptr;
+    rnctx->params.load_stage_callback_user_data = nullptr;
+    if (ok) emit_load_stage(&holder, LOAD_STAGE_READY);
     if (cbClass != nullptr) env->DeleteLocalRef(cbClass);
 
     if (!ok) {

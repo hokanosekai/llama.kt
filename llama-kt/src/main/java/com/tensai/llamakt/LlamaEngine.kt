@@ -64,12 +64,44 @@ data class BackendInfo(
 )
 
 /**
- * Model-loading progress callback. [onProgress] receives a value in 0.0–1.0
- * and is called from the loading thread. Return true to continue loading,
- * false to abort (load() will then throw).
+ * Coarse phases of a model load, in the order [LoadProgressCallback.onStage] reports them.
+ * [id] is the value the native side sends (see LOAD_STAGE_READY and common_load_stage).
+ */
+enum class LoadStage(val id: Int) {
+    /** Reading and mapping the weights; [LoadProgressCallback.onProgress] reports 0..1 in here. */
+    Weights(0),
+
+    /** Creating the context: KV cache allocation and compute graph reservation. No progress. */
+    Context(1),
+
+    /** First decode on the freshly built context (backend warm-up). No progress. */
+    Warmup(2),
+
+    /** The model is usable. */
+    Ready(3),
+
+    ;
+
+    companion object {
+        fun fromId(id: Int): LoadStage? = entries.firstOrNull { it.id == id }
+    }
+}
+
+/**
+ * Model-loading progress callback. [onProgress] receives a value in 0.0-1.0
+ * (weights only) and is called from the loading thread. Return true to
+ * continue loading, false to abort (load() will then throw).
+ *
+ * [onStage] is optional on the native side: it looks the method up by name and skips stage
+ * events when the implementation has none. Do not rely on a SAM lambda receiving stages:
+ * depending on the Kotlin default-method mode, `onStage` can be abstract in the bytecode of
+ * the lambda class or absent from it. To get stages, implement the interface in an `object`
+ * and override both methods. Stage ids are [LoadStage.id]; unknown ids should be ignored.
  */
 fun interface LoadProgressCallback {
     fun onProgress(progress: Float): Boolean
+
+    fun onStage(stage: Int) {}
 }
 
 /**

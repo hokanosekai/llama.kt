@@ -8,7 +8,7 @@
 # 99f3dc32296f825fec94f202da1e9fede1e78cf9, the same commit as our submodule.
 # The inherited patches are written against that llama.cpp, so the two move
 # together (TEN-87). bootstrap.sh copies the rn-* files verbatim (the LM_
-# rewrite explicitly skips rn-*); the three targets of patches/0002 are the only
+# rewrite explicitly skips rn-*); the targets of patches/0002 and 0004 (rn-*) and 0005 (common.*) are the only
 # ones that differ from this commit's cpp/ tree.
 #
 # To bump: pick the new llama.rn revision, put its full sha here, move the
