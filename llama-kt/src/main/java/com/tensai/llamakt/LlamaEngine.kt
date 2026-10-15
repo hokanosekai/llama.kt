@@ -455,6 +455,17 @@ class LlamaEngine {
          */
         fun kvShapeVersion(): Long = nativeKvShapeVersion()
 
+        /**
+         * llama.cpp's own system info string, e.g.
+         * `CPU : NEON = 1 | ARM_FMA = 1 | DOTPROD = 1 | ...`: the CPU features ggml-cpu was
+         * built with and detected at runtime. Static, no model needed. Empty when the native
+         * side failed.
+         */
+        fun systemInfo(): String = nativeSystemInfo()
+
+        @JvmStatic
+        private external fun nativeSystemInfo(): String
+
         @JvmStatic
         private external fun nativeKvShapeVersion(): Long
 

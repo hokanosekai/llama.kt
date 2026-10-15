@@ -6,7 +6,7 @@
  *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
  *   nativeInterrupt, nativeSaveSession, nativeLoadSession,
  *   nativeListBackends, nativeActiveBackend,
- *   nativeReadGgufMetadata, nativeKvShapeVersion
+ *   nativeReadGgufMetadata, nativeKvShapeVersion, nativeSystemInfo
  *
  * KV used-cells strategy: this version of llama.cpp (b9769) exposes no
  * public llama_kv_self_used_cells() or llama_kv_self_n_tokens(). The
@@ -779,6 +779,24 @@ Java_com_tensai_llamakt_LlamaEngine_nativeKvShapeVersion(
         jclass /* clazz */)
 {
     return static_cast<jlong>(TENSAI_KV_SHAPE_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// nativeSystemInfo  (static, no model required)
+// ---------------------------------------------------------------------------
+// llama_print_system_info(): one line per registered backend, "CPU : NEON = 1 |
+// ARM_FMA = 1 | DOTPROD = 1 | ...". What ggml-cpu was compiled with and found
+// at runtime, which is the answer to "will this device use the fast kernels".
+// Plain text; the caller parses it.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeSystemInfo(
+        JNIEnv* env,
+        jclass /* clazz */)
+{
+    return jni_guard("nativeSystemInfo",
+                     [&] { return std_to_jstring(env, std::string(llama_print_system_info())); },
+                     [&] { return env->NewStringUTF(""); });
 }
 
 // ---------------------------------------------------------------------------
