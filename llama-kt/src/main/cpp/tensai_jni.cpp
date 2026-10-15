@@ -72,7 +72,6 @@
 //       model with a smaller SWA head dimension than its full-attention one
 //       (Gemma 4: 9216 elements/token instead of 6144), and versions 1 and 2
 //       both charged gemma3n for all of its blocks instead of the first 20.
-//
 // Versions 1 and 2 both shipped before this constant existed, so neither was
 // ever reported; a caller holding numbers with no version recorded cannot
 // tell which of the two it has and must re-read.
@@ -546,9 +545,15 @@ static jstring readGgufMetadata_impl(JNIEnv* env, jstring path)
     // Thinking capability: no dedicated GGUF key — detect from the chat
     // template (jinja string in the header). Thinking-capable templates
     // reference enable_thinking (Qwen3) or emit <think> blocks.
+    // A separate named template for tool use is how many models ship tool support.
+    const bool has_tool_use_template =
+        lm_gguf_find_key(gctx, "tokenizer.chat_template.tool_use") >= 0;
+    // The raw template is also returned so the caller can apply its own
+    // capability rules (tools) with one shared implementation.
+    const std::string chat_template = get_str("tokenizer.chat_template");
     bool supports_thinking = false;
     {
-        const std::string tmpl = get_str("tokenizer.chat_template");
+        const std::string& tmpl = chat_template;
         supports_thinking = tmpl.find("enable_thinking") != std::string::npos
                          || tmpl.find("<think>") != std::string::npos;
     }
@@ -711,6 +716,8 @@ static jstring readGgufMetadata_impl(JNIEnv* env, jstring path)
         {"vocab_size",       vocab},
         {"file_size_bytes",  file_size},
         {"supports_thinking", supports_thinking},
+        {"chat_template",    chat_template},
+        {"tool_use_template", has_tool_use_template},
         {"head_count",              head_count},
         {"head_count_kv",           head_count_kv},
         {"kv_full_elements_per_token", kv_full_elements},
@@ -733,7 +740,12 @@ static jstring readGgufMetadata_impl(JNIEnv* env, jstring path)
     // is what keeps nlohmann from throwing.)
     const std::string out = j.dump(-1, ' ', false,
                                    nlohmann::json::error_handler_t::replace);
-    LOGI("nativeReadGgufMetadata: %s", out.c_str());
+    // The template is kilobytes of Jinja: log its size, not its text.
+    nlohmann::json logged = j;
+    logged.erase("chat_template");
+    logged["chat_template_len"] = chat_template.size();
+    LOGI("nativeReadGgufMetadata: %s",
+         logged.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).c_str());
     return std_to_jstring(env, out);
 }
 

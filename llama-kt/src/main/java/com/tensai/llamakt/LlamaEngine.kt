@@ -146,6 +146,10 @@ data class GgufMetadata(
     val fileSizeBytes: Long,
     /** Detected from the chat template (enable_thinking / <think> markers). */
     val supportsThinking: Boolean,
+    /** Raw Jinja chat template from the header, empty when it has none. */
+    val chatTemplate: String = "",
+    /** The GGUF also ships a separate `tokenizer.chat_template.tool_use` template. */
+    val hasToolUseTemplate: Boolean = false,
     val headCount: Long = 0,
     val headCountKv: Long = 0,
     val kvFullElementsPerToken: Long = 0,
@@ -416,6 +420,8 @@ class LlamaEngine {
                     vocabSize       = obj.optLong("vocab_size", 0),
                     fileSizeBytes   = obj.optLong("file_size_bytes", 0),
                     supportsThinking = obj.optBoolean("supports_thinking", false),
+                    chatTemplate    = obj.optString("chat_template", ""),
+                    hasToolUseTemplate = obj.optBoolean("tool_use_template", false),
                     headCount       = obj.optLong("head_count", 0),
                     headCountKv     = obj.optLong("head_count_kv", 0),
                     kvFullElementsPerToken = obj.optLong("kv_full_elements_per_token", 0),

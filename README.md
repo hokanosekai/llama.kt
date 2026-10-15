@@ -143,6 +143,8 @@ data class GgufMetadata(
     val contextLength: Long, val embeddingLength: Long, val blockCount: Long,
     val paramCount: Long, val vocabSize: Long, val fileSizeBytes: Long,
     val supportsThinking: Boolean,  // detected from the chat template markers
+    val chatTemplate: String,       // raw Jinja chat template, "" when absent
+    val hasToolUseTemplate: Boolean, // separate tokenizer.chat_template.tool_use present
 )
 
 fun interface LoadProgressCallback { fun onProgress(progress: Float): Boolean }
