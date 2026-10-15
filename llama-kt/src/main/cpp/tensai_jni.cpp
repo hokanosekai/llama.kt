@@ -33,6 +33,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "tensai_utf.h"
+#include "tensai_chat_templates.hpp"
 
 #include <sys/stat.h>
 
@@ -851,7 +852,8 @@ static jlong loadModel_impl(
         jint nThreads,
         jobject progressCb,
         jstring kvCacheType,
-        jstring flashAttn)
+        jstring flashAttn,
+        jstring chatTemplate)
 {
     // Owned rather than raw: loadModel() below runs llama.cpp's whole model
     // loader, which throws on a file it can't make sense of, and the context
@@ -886,6 +888,13 @@ static jlong loadModel_impl(
     const std::string fa = jstring_to_std(env, flashAttn);
     if (!fa.empty()) {
         p.flash_attn_type = rnllama::flash_attn_type_from_str(fa);
+    }
+
+    // Forced chat template (TEN-159): a name from tensai_chat_templates.hpp, empty keeps the
+    // GGUF's own. common_chat_templates_init() reads it from params.chat_template at load.
+    const std::string forced_template = jstring_to_std(env, chatTemplate);
+    if (!forced_template.empty()) {
+        p.chat_template = tensai::resolve_chat_template(forced_template);
     }
 
     LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d kv_cache=%s",
@@ -947,13 +956,14 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jint nThreads,
         jobject progressCb,
         jstring kvCacheType,
-        jstring flashAttn)
+        jstring flashAttn,
+        jstring chatTemplate)
 {
     // 0 is the handle value the Kotlin side already reads as "load failed".
     return jni_guard("nativeLoadModel",
                      [&] {
                          return loadModel_impl(env, path, nGpuLayers, nCtx, nThreads,
-                                               progressCb, kvCacheType, flashAttn);
+                                               progressCb, kvCacheType, flashAttn, chatTemplate);
                      },
                      [] { return (jlong) 0; });
 }
@@ -1654,6 +1664,8 @@ static jstring formatChat_impl(
         // stale parser to this prompt's output.
         chat_state_erase(rnctx);
         try {
+            // Empty template → rnctx->templates, which was built at load from
+            // params.chat_template, so a forced template (TEN-159) is kept here too.
             formatted = rnctx->getFormattedChat(msgs, "");
         } catch (const std::exception& e2) {
             LOGE("nativeFormatChat: exception: %s", e2.what());

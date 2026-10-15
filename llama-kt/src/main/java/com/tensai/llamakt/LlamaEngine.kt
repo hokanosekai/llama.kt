@@ -216,6 +216,9 @@ class LlamaEngine {
      * [flashAttn] — flash attention: null → auto (llama.cpp decides), "on",
      *   "off". On GPUs without matrix cores (Mali) the generic FA path can
      *   cost instead of help — worth benchmarking per device.
+     * [chatTemplate]: chat template to use instead of the GGUF's own: null or empty →
+     *   the file's, "chatml" / "mistral" / "llama3" / "gemma" / "phi3" → that format, any other
+     *   string → taken as a Jinja template source.
      * Throws [IllegalStateException] if the native load fails or is aborted.
      */
     fun load(
@@ -226,13 +229,14 @@ class LlamaEngine {
         onProgress: LoadProgressCallback? = null,
         kvCacheType: String? = null,
         flashAttn: String? = null,
+        chatTemplate: String? = null,
     ) {
         val resolved = when {
             nThreads > 0 -> nThreads
             nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
             else -> 0                              // -1 → llama auto
         }
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType, flashAttn)
+        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType, flashAttn, chatTemplate)
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -367,7 +371,7 @@ class LlamaEngine {
     private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(
         path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int,
-        progressCb: LoadProgressCallback?, kvCacheType: String?, flashAttn: String?,
+        progressCb: LoadProgressCallback?, kvCacheType: String?, flashAttn: String?, chatTemplate: String?,
     ): Long
     private external fun nativeFree(h: Long)
     private external fun nativeCompletion(
