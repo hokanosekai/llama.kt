@@ -328,7 +328,8 @@ static void chat_state_set_prompt(const void* key, std::string prompt) {
 // enumerates lm_ggml_backend_dev_count() devices and collects:
 //   backend  — backend registry name (e.g. "Vulkan", "CPU", "OpenCL")
 //   type     — "cpu" | "gpu" | "igpu" | "accel"
-//   deviceName — human-readable device name (e.g. "Mali-G68 MC4")
+//   deviceName - ggml device id (e.g. "Vulkan0"), not a hardware name
+//   deviceDescription - driver-reported hardware name (e.g. "Mali-G68 MC4"), may be empty
 
 // backend_devices_info() builds and dumps a nlohmann::json out of driver-
 // supplied device names, so it throws on the same UTF-8 rule as everything

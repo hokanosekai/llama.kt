@@ -53,7 +53,8 @@ data class SamplingParams(
 
 /**
  * Information about a single ggml backend device.
- * [name] — device name as reported by ggml (e.g. "Mali-G68 MC4")
+ * [name] - ggml device id (e.g. "Vulkan0"), not a hardware name
+ * [deviceDescription] - driver-reported hardware name (e.g. "Mali-G68 MC4"), empty when unknown
  * [description] — backend registry name (e.g. "Vulkan", "CPU")
  * [type] — "cpu", "gpu", "igpu", or "accel"
  */
@@ -61,6 +62,7 @@ data class BackendInfo(
     val name: String,
     val description: String,
     val type: String,
+    val deviceDescription: String = "",
 )
 
 /**
@@ -180,6 +182,7 @@ class LlamaEngine {
                 name        = obj.optString("deviceName", "Unknown"),
                 description = obj.optString("backend", "unknown"),
                 type        = obj.optString("type", "unknown"),
+                deviceDescription = obj.optString("deviceDescription", ""),
             )
         }
     }

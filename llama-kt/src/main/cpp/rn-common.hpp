@@ -67,6 +67,8 @@ inline static std::string backend_devices_info() {
 
         // Device name and description
         device_info["deviceName"] = props.name ? props.name : "Unknown Device";
+        // Human-readable marketing name from the driver (e.g. "Mali-G68 MC4"); "" when none.
+        device_info["deviceDescription"] = props.description ? props.description : "";
 
         // Memory information
         size_t memory_total = props.memory_total;
