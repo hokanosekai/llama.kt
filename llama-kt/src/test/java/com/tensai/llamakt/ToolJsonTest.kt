@@ -37,6 +37,25 @@ class ToolJsonTest {
     }
 
     @Test
+    fun reasoningIsSentOnlyWhenThereIsSome() {
+        val arr = ToolJson.messages(
+            listOf(
+                ChatMessage("assistant", "", reasoningContent = "let me think"),
+                ChatMessage("assistant", "hi"),
+            ),
+        )
+        assertEquals("let me think", arr.getJSONObject(0).getString("reasoning_content"))
+        assertFalse(arr.getJSONObject(1).has("reasoning_content"))
+    }
+
+    @Test
+    fun reasoningSurvivesAJsonRoundTrip() {
+        val text = "say \"hi\"\nthen \\ done, \u00e9\u00e8 \u65e5\u672c"
+        val arr = ToolJson.messages(listOf(ChatMessage("assistant", "", reasoningContent = text)))
+        assertEquals(text, org.json.JSONArray(arr.toString()).getJSONObject(0).getString("reasoning_content"))
+    }
+
+    @Test
     fun toolsBecomeFunctionDefinitions() {
         val tools = ToolJson.tools(
             listOf(ToolDefinition("calc", "does maths", """{"type":"object","properties":{"expr":{"type":"string"}}}""")),

@@ -36,12 +36,15 @@ enum class ToolChoice(val wire: String) {
  *
  * [toolCalls]: calls an assistant message made, so a later turn can replay them next to their results.
  * [toolCallId]: for role "tool", the [ToolCall.id] this message answers.
+ * [reasoningContent]: the reasoning an assistant message came with, sent as `reasoning_content`. Whether it is
+ *   rendered is the template's call (Qwen3 keeps it after the last user message only). Empty sends nothing.
  */
 data class ChatMessage(
     val role: String,
     val content: String,
     val toolCalls: List<ToolCall> = emptyList(),
     val toolCallId: String? = null,
+    val reasoningContent: String = "",
 )
 
 /**
@@ -102,6 +105,7 @@ internal object ToolJson {
                 obj.put("tool_calls", calls)
             }
             if (msg.toolCallId != null) obj.put("tool_call_id", msg.toolCallId)
+            if (msg.reasoningContent.isNotEmpty()) obj.put("reasoning_content", msg.reasoningContent)
             arr.put(obj)
         }
         return arr
