@@ -1001,6 +1001,19 @@ static jlong loadModel_impl(
     p.n_ctx        = static_cast<int32_t>(nCtx > 0 ? nCtx : 4096);
     if (p.n_batch <= 0) p.n_batch = 512;
 
+    // A CPU load keeps every GPU out of the context (TEN-182). llama.cpp lists all GPU devices
+    // whatever n_gpu_layers is, so the Vulkan backend was still in the scheduler and its op offload
+    // sent each prefill matmul with weights in host memory to the Mali (368 graph splits per 512
+    // tokens, weights re-uploaded each time): prefill ran at decode speed, ~6 tok/s, and a ~400 MiB
+    // Vulkan compute buffer was reserved for nothing. A null-terminated list holding only the
+    // terminator is "no GPU device"; the CPU backend is added separately. With layers offloaded the
+    // defaults stay.
+    const bool cpu_only = p.n_gpu_layers == 0;
+    if (cpu_only) {
+        p.devices.push_back(nullptr);
+        p.no_op_offload = true;
+    }
+
     // nThreads <= 0 → keep llama.cpp auto-detect. On big.LITTLE SoCs fewer
     // threads on big cores can beat auto across all cores. nThreadsBatch sizes
     // the batch (prefill) pool on its own, and follows nThreads when it is not
@@ -1083,6 +1096,7 @@ static jlong loadModel_impl(
     // What the context really got (not what was asked) and what the CPU backend can use: a Q4_K
     // prefill that runs far below the expected tok/s is a build without dotprod/repack, or threads
     // that never reached the context (TEN-182).
+    LOGI("loadModel: devices=%s op_offload=%s", cpu_only ? "cpu-only" : "all (gpu layers offloaded)", p.no_op_offload ? "off" : "on");
     LOGI("loadModel: context n_threads=%d n_threads_batch=%d n_batch=%u n_ubatch=%u", llama_n_threads(rnctx->ctx), llama_n_threads_batch(rnctx->ctx), llama_n_batch(rnctx->ctx), llama_n_ubatch(rnctx->ctx));
     LOGI("loadModel: system_info %s", llama_print_system_info());
     // Ownership moves to the Kotlin side, which gives it back in nativeFree().
