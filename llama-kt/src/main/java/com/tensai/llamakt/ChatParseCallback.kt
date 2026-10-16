@@ -24,12 +24,20 @@ package com.tensai.llamakt
  * - Fires at most once per sampled token, and is skipped entirely when a token changes neither
  *   value (which happens while the parser holds text back on an ambiguous marker).
  * - The last call for a completion carries the fully resolved reply.
+ * - With tools in the prompt ([LlamaEngine.formatChatWithTools]), it also fires once, the first time,
+ *   with nothing resolved yet, and again whenever the calls being written change. A reply that opens
+ *   on a call marker is held back whole by the parser: the empty first call is how the caller
+ *   knows to show nothing rather than the raw text. Without tools it never fires on an empty reply.
  */
 fun interface ChatParseCallback {
     /**
      * @param content the answer, markers stripped.
      * @param reasoningContent the reasoning that preceded it, markers stripped. Empty when the
      *   model produced none (or when the template has no notion of reasoning at all).
+     * @param toolCalls the names of the tool calls the parser sees so far, in order, always empty
+     *   without tools. The last one may still be being written: its name can be empty or cut
+     *   short, so match it against the tools you offered before trusting it. Arguments are not
+     *   reported, they only exist in [LlamaEngine.lastChatResult].
      */
-    fun onChatParse(content: String, reasoningContent: String)
+    fun onChatParse(content: String, reasoningContent: String, toolCalls: Array<String>)
 }

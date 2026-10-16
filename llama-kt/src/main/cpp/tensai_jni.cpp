@@ -331,6 +331,9 @@ struct chat_parse_state {
     // template cannot render them, so the prompt was built without. Read back by
     // nativeChatResult() together with the outcome of the last completion on this prompt.
     bool                    tools_ignored = false;
+    // Tools made it into the prompt: the streaming parse then also reports the calls being
+    // written (ChatParseCallback.toolCalls), and says so even before it has anything to show.
+    bool                    has_tools = false;
     bool                    has_result = false;
     bool                    tool_parse_failed = false;
     bool                    truncated = false;
@@ -1126,7 +1129,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // ---------------------------------------------------------------------------
 // Kotlin interface attendue : interface TokenCallback { fun onToken(token: String) }
 // cbChat (nullable) : interface ChatParseCallback {
-//     fun onChatParse(content: String, reasoningContent: String) }
+//     fun onChatParse(content: String, reasoningContent: String, toolCalls: Array<String>) }
 //
 // Returns the number of tokens the decode actually sampled
 // (completion->num_tokens_predicted), which is the only figure that can be
@@ -1194,7 +1197,7 @@ static jint completion_impl(
     if (cbChat != nullptr) {
         chatCbClass = env->GetObjectClass(cbChat);
         onChatParse = env->GetMethodID(chatCbClass, "onChatParse",
-                                       "(Ljava/lang/String;Ljava/lang/String;)V");
+                                       "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
         if (onChatParse == nullptr) {
             LOGE("nativeCompletion: onChatParse method not found");
             env->DeleteLocalRef(chatCbClass);
@@ -1345,6 +1348,8 @@ static jint completion_impl(
     // no-op update and never allocates a String for one.
     std::string last_content;
     std::string last_reasoning;
+    std::vector<std::string> last_names;
+    bool chat_signalled = false;
     bool parse_failed_logged = false;
     // Outcome of the latest parse, read after the final one (TEN-171).
     bool parse_ok = false;
@@ -1362,6 +1367,19 @@ static jint completion_impl(
     // Well under a percent of wall time, so no throttling: the alternative
     // (parse every N tokens) would trade an always-correct stream for a
     // saving that does not exist.
+    // A Kotlin callback that throws would leave the exception pending across the next JNI call,
+    // which is undefined behaviour. Describe it, clear it and stop the decode instead.
+    auto jni_failed = [&](const char* what) {
+        if (!env->ExceptionCheck()) return false;
+        LOGE("nativeCompletion: exception in %s, interrupting", what);
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        comp->is_interrupted = true;
+        return true;
+    };
+    // java/lang/String, resolved once for the names array of every chat callback; deleted at exit.
+    jclass stringClass = nullptr;
+
     auto emit_parse = [&](bool is_partial, bool is_final = false) {
         if (!parse_chat) return;
         if (is_partial && !is_final && onChatParse == nullptr) return;
@@ -1383,21 +1401,49 @@ static jint completion_impl(
         parse_ok = true;
         if (is_final) last_out = out;
         if (onChatParse == nullptr) return;
-        if (out.content.empty() && out.reasoning_content.empty()) return;
-        if (out.content == last_content && out.reasoning_content == last_reasoning) return;
+        // Names of the calls the parser has seen so far, the last one possibly still being
+        // written (its name can be cut short, or empty). Only for a prompt that carries tools.
+        std::vector<std::string> names;
+        if (chat_state.has_tools) {
+            for (const auto& tc : out.tool_calls) names.push_back(tc.name);
+        }
+        const bool nothing = out.content.empty() && out.reasoning_content.empty() && names.empty();
+        // A prompt with tools gets one callback even with nothing resolved yet, the first time:
+        // a reply that opens on a call marker holds everything back, and the caller must be
+        // able to tell "the parser is on it, show nothing" from "no parser".
+        if (nothing && !(chat_state.has_tools && !chat_signalled)) return;
+        if (chat_signalled && out.content == last_content && out.reasoning_content == last_reasoning
+            && names == last_names) return;
+        chat_signalled = true;
         last_content   = out.content;
         last_reasoning = out.reasoning_content;
+        last_names     = names;
 
         // Both can end mid multi-byte character on a partial parse.
         const std::string safe_content   = utf8_sanitized_copy(last_content);
         const std::string safe_reasoning = utf8_sanitized_copy(last_reasoning);
         jstring jcontent   = std_to_jstring(env, safe_content);
         jstring jreasoning = std_to_jstring(env, safe_reasoning);
-        if (jcontent != nullptr && jreasoning != nullptr) {
-            env->CallVoidMethod(cbChat, onChatParse, jcontent, jreasoning);
+        if (stringClass == nullptr) stringClass = env->FindClass("java/lang/String");
+        jobjectArray jnames = stringClass == nullptr ? nullptr
+            : env->NewObjectArray((jsize) names.size(), stringClass, nullptr);
+        if (jni_failed("NewObjectArray")) jnames = nullptr;
+        if (jnames != nullptr) {
+            for (size_t i = 0; i < names.size(); i++) {
+                jstring jn = std_to_jstring(env, utf8_sanitized_copy(names[i]));
+                if (jn != nullptr) {
+                    env->SetObjectArrayElement(jnames, (jsize) i, jn);
+                    env->DeleteLocalRef(jn);
+                }
+            }
+        }
+        if (jcontent != nullptr && jreasoning != nullptr && jnames != nullptr) {
+            env->CallVoidMethod(cbChat, onChatParse, jcontent, jreasoning, jnames);
+            jni_failed("onChatParse");
         }
         if (jcontent   != nullptr) env->DeleteLocalRef(jcontent);
         if (jreasoning != nullptr) env->DeleteLocalRef(jreasoning);
+        if (jnames     != nullptr) env->DeleteLocalRef(jnames);
     };
 
     // UTF-8 holdback buffer: only complete sequences ever reach std_to_jstring.
@@ -1409,6 +1455,7 @@ static jint completion_impl(
         if (ready.empty()) return;
         jstring jtok = std_to_jstring(env, ready);
         env->CallVoidMethod(cb, onToken, jtok);
+        jni_failed("onToken");
         env->DeleteLocalRef(jtok);
     };
 
@@ -1535,6 +1582,7 @@ static jint completion_impl(
     // never called from here, and it skips n_past == 0 anyway.
     if (!comp->context_full) trim_embd_to_n_past(comp);
 
+    if (stringClass != nullptr) env->DeleteLocalRef(stringClass);
     env->DeleteLocalRef(cbClass);
     if (chatCbClass != nullptr) env->DeleteLocalRef(chatCbClass);
 
@@ -1815,7 +1863,8 @@ static jstring formatChat_impl(
         chat_parse_state state;
         state.parsable          = true;
         state.tools_ignored     = tools_ignored;
-        state.format            = static_cast<int>(params.format);
+        state.has_tools         = !tools.empty();
+        state.format           = static_cast<int>(params.format);
         state.reasoning_format  = COMMON_REASONING_FORMAT_AUTO;
         state.generation_prompt = params.generation_prompt;
         state.parser            = params.parser;
