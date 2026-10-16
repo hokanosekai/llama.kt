@@ -3,9 +3,6 @@ package com.tensai.llamakt
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** A single message in a chat conversation. */
-data class ChatMessage(val role: String, val content: String)
-
 /**
  * Sampling parameters for a completion.
  *
@@ -287,16 +284,60 @@ class LlamaEngine {
      * derived from the template — that is what lets [completion] fill a
      * [ChatParseCallback] when handed back this exact prompt.
      */
-    fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String {
-        val arr = JSONArray()
-        for (msg in messages) {
-            val obj = JSONObject()
-            obj.put("role", msg.role)
-            obj.put("content", msg.content)
-            arr.put(obj)
-        }
-        return nativeFormatChat(handle, arr.toString(), enableThinking)
+    fun formatChat(messages: List<ChatMessage>, enableThinking: Boolean = true): String =
+        nativeFormatChat(handle, ToolJson.messages(messages).toString(), enableThinking, "", "", false)
+
+    /**
+     * [formatChat] with [tools] rendered into the prompt through the model's chat template, which
+     * is what makes the model able to call them. [messages] may carry assistant [ChatMessage.toolCalls]
+     * and role "tool" messages, to replay earlier calls with their results.
+     *
+     * A template that cannot render tools does not fail: the prompt is built without them and
+     * [FormattedChat.toolsIgnored] says so, since the model then never hears of the tools.
+     * Empty [tools] is plain [formatChat].
+     *
+     * [toolChoice]: see [ToolChoice]. [parallelToolCalls]: whether one reply may hold several
+     * calls. It changes the parser llama.cpp derives (how many calls it accepts), so it must match
+     * what the caller is ready to execute.
+     *
+     * @throws IllegalArgumentException when a replayed [ToolCall.argumentsJson] is not a JSON object.
+     *
+     * After [completion] on this prompt, [lastChatResult] holds the parsed tool calls.
+     */
+    fun formatChatWithTools(
+        messages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+        toolChoice: ToolChoice = ToolChoice.Auto,
+        enableThinking: Boolean = true,
+        parallelToolCalls: Boolean = true,
+    ): FormattedChat {
+        val toolsJson = if (tools.isEmpty()) "" else ToolJson.tools(tools).toString()
+        val prompt = nativeFormatChat(
+            handle, ToolJson.messages(messages).toString(), enableThinking, toolsJson,
+            if (tools.isEmpty()) "" else toolChoice.wire, parallelToolCalls,
+        )
+        val ignored = ToolJson.toolsIgnored(nativeChatResult(handle))
+        return FormattedChat(prompt, ignored)
     }
+
+    /**
+     * The reply of the last [completion], as llama.cpp's chat parser (the one derived from the
+     * template, same as [ChatParseCallback]) split it into answer, reasoning and tool calls.
+     * Final, not cumulative. Read it right after [completion] returns, before any [formatChat],
+     * [formatChatWithTools] or warm-up: there is one slot per engine and those overwrite it.
+     * Ignore it when [completion] returned 0 or less (nothing was generated, or the native side
+     * failed): the result is then cleared or partial.
+     *
+     * Null when there is nothing to report: no completion since the last [formatChat] /
+     * [formatChatWithTools], a prompt that did not come from them, or a template that could not be
+     * rendered with jinja. A reply the parser rejects is not null: see [ChatResult.toolParseFailed].
+     *
+     * Streaming: [TokenCallback] always gets the raw text, a tool call included. For a stream that
+     * never shows call text, display the [ChatParseCallback] content instead: the parser holds a
+     * call back as it is written and keeps it out of the content. Calls themselves only exist here,
+     * in the final result.
+     */
+    fun lastChatResult(): ChatResult? = ToolJson.result(nativeChatResult(handle))
 
     /**
      * Run a completion for [prompt], streaming tokens via [callback].
@@ -384,7 +425,11 @@ class LlamaEngine {
         cbChat: ChatParseCallback?,
     ): Int
     private external fun nativePrefill(h: Long, prompt: String): Int
-    private external fun nativeFormatChat(h: Long, messagesJson: String, enableThinking: Boolean): String
+    private external fun nativeFormatChat(
+        h: Long, messagesJson: String, enableThinking: Boolean, toolsJson: String, toolChoice: String,
+        parallelToolCalls: Boolean,
+    ): String
+    private external fun nativeChatResult(h: Long): String
     private external fun nativeTokenize(h: Long, text: String): IntArray
     private external fun nativeKvCacheUsedCells(h: Long): Int
     private external fun nativeInterrupt(h: Long)

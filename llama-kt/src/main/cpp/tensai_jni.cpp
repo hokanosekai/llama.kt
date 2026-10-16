@@ -3,7 +3,7 @@
  *
  * Entry points:
  *   nativeLoadModel, nativeFree, nativeCompletion, nativePrefill,
- *   nativeFormatChat, nativeTokenize, nativeKvCacheUsedCells,
+ *   nativeFormatChat, nativeChatResult, nativeTokenize, nativeKvCacheUsedCells,
  *   nativeInterrupt, nativeSaveSession, nativeLoadSession,
  *   nativeListBackends, nativeActiveBackend,
  *   nativeReadGgufMetadata, nativeKvShapeVersion, nativeSystemInfo
@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <random>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -325,6 +326,17 @@ struct chat_parse_state {
     // parsing an arbitrary completion with a chat template's parser would at
     // best produce nonsense.
     std::string             prompt;
+
+    // Tool calling (TEN-171). tools_ignored: tools were passed to nativeFormatChat() but the
+    // template cannot render them, so the prompt was built without. Read back by
+    // nativeChatResult() together with the outcome of the last completion on this prompt.
+    bool                    tools_ignored = false;
+    bool                    has_result = false;
+    bool                    tool_parse_failed = false;
+    bool                    truncated = false;
+    std::string             result_content;
+    std::string             result_reasoning;
+    std::vector<common_chat_tool_call> result_tool_calls;
 };
 
 static std::mutex                                   g_chat_state_mu;
@@ -351,6 +363,46 @@ static void chat_state_set_prompt(const void* key, std::string prompt) {
     std::lock_guard<std::mutex> lock(g_chat_state_mu);
     auto it = g_chat_state.find(key);
     if (it != g_chat_state.end()) it->second.prompt = std::move(prompt);
+}
+
+// Dropped at the start of every completion: a result only describes the completion that
+// produced it, never an earlier one on the same prompt.
+static void chat_state_clear_result(const void* key) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    auto it = g_chat_state.find(key);
+    if (it == g_chat_state.end()) return;
+    it->second.has_result = false;
+    it->second.tool_parse_failed = false;
+    it->second.truncated = false;
+    it->second.result_content.clear();
+    it->second.result_reasoning.clear();
+    it->second.result_tool_calls.clear();
+}
+
+static void chat_state_set_result(const void* key, bool parse_failed, bool truncated, std::string content,
+                                  std::string reasoning, std::vector<common_chat_tool_call> calls) {
+    std::lock_guard<std::mutex> lock(g_chat_state_mu);
+    auto it = g_chat_state.find(key);
+    if (it == g_chat_state.end()) return;
+    auto& s = it->second;
+    s.has_result        = true;
+    s.tool_parse_failed = parse_failed;
+    s.truncated         = truncated;
+    s.result_content    = std::move(content);
+    s.result_reasoning  = std::move(reasoning);
+    s.result_tool_calls = std::move(calls);
+}
+
+// Some parsers (Hermes-style JSON, for one) leave the call id empty. The app matches a tool
+// result to its call by id, so an empty one is replaced by a fresh "call_xxxxxxxx".
+static std::string gen_tool_call_id() {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    static std::mutex mu;
+    static std::mt19937 rng{std::random_device{}()};
+    std::lock_guard<std::mutex> lock(mu);
+    std::string id = "call_";
+    for (int i = 0; i < 8; i++) id += alphabet[rng() % (sizeof(alphabet) - 1)];
+    return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1168,10 @@ static jint completion_impl(
         jobject cb,
         jobject cbChat)
 {
+    // First thing, before every early return: a result only describes the completion that
+    // produced it (TEN-171), and a completion that dies early produced none.
+    if (h != 0L) chat_state_clear_result(to_ctx(h));
+
     if (h == 0L) return 0;
     auto* rnctx = to_ctx(h);
 
@@ -1270,7 +1326,9 @@ static jint completion_impl(
     // Without them beginCompletion() defaults to CONTENT_ONLY + reasoning NONE
     // and every reasoning marker the model emits stays in the content.
     // (chat_state / chat_state_applies are resolved above, before sampling.)
-    const bool parse_chat = chat_state_applies && onChatParse != nullptr;
+    // Parsed even without a callback: the final parse is what yields the tool calls (TEN-171).
+    // Per-token partial parses stay tied to the callback, they only feed it.
+    const bool parse_chat = chat_state_applies;
 
     if (chat_state_applies) {
         comp->beginCompletion(chat_state.format, chat_state.reasoning_format,
@@ -1288,6 +1346,9 @@ static jint completion_impl(
     std::string last_content;
     std::string last_reasoning;
     bool parse_failed_logged = false;
+    // Outcome of the latest parse, read after the final one (TEN-171).
+    bool parse_ok = false;
+    rnllama::completion_chat_output last_out;
 
     // Re-parses the whole reply so far. Deliberately: llama.cpp's chat parser
     // is not incremental, and a partial parse can *retract* text (bytes that
@@ -1301,12 +1362,14 @@ static jint completion_impl(
     // Well under a percent of wall time, so no throttling: the alternative
     // (parse every N tokens) would trade an always-correct stream for a
     // saving that does not exist.
-    auto emit_parse = [&](bool is_partial) {
+    auto emit_parse = [&](bool is_partial, bool is_final = false) {
         if (!parse_chat) return;
+        if (is_partial && !is_final && onChatParse == nullptr) return;
         rnllama::completion_chat_output out;
         try {
             out = comp->parseChatOutput(is_partial);
         } catch (const std::exception& e) {
+            parse_ok = false;
             // common_chat_parse() throws when the reply does not match the
             // format the template advertised. Not fatal — the raw token
             // stream is unaffected, the caller just gets no split for this
@@ -1317,6 +1380,9 @@ static jint completion_impl(
             }
             return;
         }
+        parse_ok = true;
+        if (is_final) last_out = out;
+        if (onChatParse == nullptr) return;
         if (out.content.empty() && out.reasoning_content.empty()) return;
         if (out.content == last_content && out.reasoning_content == last_reasoning) return;
         last_content   = out.content;
@@ -1442,7 +1508,26 @@ static jint completion_impl(
         }
         // An interrupted reply is by definition unfinished — parsing it as
         // complete would only throw on a marker the model never got to close.
-        emit_parse(/* is_partial */ comp->is_interrupted);
+        // Cut by the token cap or a full context: unfinished like an interrupt, so parsed leniently
+        // (a strict parse would reject the open reasoning block and lose the split).
+        const bool truncated = !comp->is_interrupted && !comp->stopped_eos && !comp->stopped_word
+                            && (comp->stopped_limit || comp->context_full);
+        const bool unfinished = comp->is_interrupted || truncated;
+        emit_parse(/* is_partial */ unfinished, /* is_final */ true);
+
+        // Final outcome for nativeChatResult(). A reply the parser rejects comes back as raw
+        // text with the failure flagged, never as an error. An interrupted reply is unfinished:
+        // its tool calls would be half-written JSON, so none are reported.
+        if (parse_ok) {
+            std::vector<common_chat_tool_call> calls;
+            if (!unfinished) calls = last_out.tool_calls;
+            for (auto& tc : calls) {
+                if (tc.id.empty()) tc.id = gen_tool_call_id();
+            }
+            chat_state_set_result(rnctx, false, truncated, last_out.content, last_out.reasoning_content, std::move(calls));
+        } else {
+            chat_state_set_result(rnctx, true, truncated, comp->generated_text, "", {});
+        }
     }
 
     // Whatever ended the loop (EOS, stop word, n_predict, interrupt, decode
@@ -1668,12 +1753,33 @@ static jstring formatChat_impl(
         JNIEnv* env,
         jlong   h,
         jstring messagesJson,
-        jboolean enableThinking)
+        jboolean enableThinking,
+        jstring toolsJson,
+        jstring toolChoice,
+        jboolean parallelToolCalls)
 {
     if (h == 0L) return env->NewStringUTF("");
     auto* rnctx = to_ctx(h);
 
     std::string msgs = jstring_to_std(env, messagesJson);
+    std::string tools = jstring_to_std(env, toolsJson);
+    std::string tool_choice = jstring_to_std(env, toolChoice);
+
+    // TEN-171: tools go through the jinja path only. A template that cannot render them (no
+    // `tools` variable, no tool-call syntax) would silently drop them and the model would never
+    // hear of them, so say so (tools_ignored) and render without. Same variant pick as
+    // common_chat_templates_apply(): the tool_use template when the GGUF ships one.
+    bool tools_ignored = false;
+    if (!tools.empty()) {
+        const bool has_tool_use = common_chat_templates_has_variant(rnctx->templates.get(), "tool_use");
+        const auto caps = common_chat_templates_get_caps(rnctx->templates.get(), has_tool_use ? "tool_use" : "");
+        if (!caps.supports_tools) {
+            LOGI("nativeFormatChat: template does not support tools, rendering without");
+            tools.clear();
+            tool_choice.clear();
+            tools_ignored = true;
+        }
+    }
 
     std::string formatted;
     try {
@@ -1694,9 +1800,9 @@ static jstring formatChat_impl(
             msgs,
             /* chat_template     */ "",
             /* json_schema       */ "",
-            /* tools             */ "",
-            /* parallel_tool_call*/ false,
-            /* tool_choice       */ "",
+            /* tools             */ tools,
+            /* parallel_tool_call*/ parallelToolCalls == JNI_TRUE,
+            /* tool_choice       */ tool_choice,
             /* enable_thinking   */ enableThinking == JNI_TRUE,
             /* reasoning_format  */ "auto",  // "" throws (Unknown reasoning format)
             /* add_generation_prompt */ true,
@@ -1708,6 +1814,7 @@ static jstring formatChat_impl(
 
         chat_parse_state state;
         state.parsable          = true;
+        state.tools_ignored     = tools_ignored;
         state.format            = static_cast<int>(params.format);
         state.reasoning_format  = COMMON_REASONING_FORMAT_AUTO;
         state.generation_prompt = params.generation_prompt;
@@ -1735,11 +1842,20 @@ static jstring formatChat_impl(
     } catch (const std::exception& e) {
         // Some templates fail under jinja — fall back to the legacy path
         // (no thinking control there).
+        if (!tools.empty()) {
+            LOGE("nativeFormatChat: tools rendering failed, tools dropped (legacy renderer has none): %s", e.what());
+        }
         LOGE("nativeFormatChat: jinja failed (%s), falling back to legacy", e.what());
         // No common_chat_params on that path, so nothing to parse the reply
         // with: drop any state a previous call left behind rather than apply a
         // stale parser to this prompt's output.
         chat_state_erase(rnctx);
+        if (!tools.empty() || tools_ignored) {
+            // The legacy renderer has no tools: say so. Not parsable, so nothing is parsed.
+            chat_parse_state legacy;
+            legacy.tools_ignored = true;
+            chat_state_put(rnctx, std::move(legacy));
+        }
         try {
             // Empty template → rnctx->templates, which was built at load from
             // params.chat_template, so a forced template (TEN-159) is kept here too.
@@ -1772,14 +1888,17 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFormatChat(
         jobject /* thiz */,
         jlong   h,
         jstring messagesJson,
-        jboolean enableThinking)
+        jboolean enableThinking,
+        jstring toolsJson,
+        jstring toolChoice,
+        jboolean parallelToolCalls)
 {
     // The two template paths above already catch std::exception, so this only
     // covers what they can't: a throw from chat_state_put/std_to_jstring after
     // them, or something that isn't a std::exception. "" is the empty prompt
     // the h == 0 and legacy-fallback-failed paths return.
     return jni_guard("nativeFormatChat",
-                     [&] { return formatChat_impl(env, h, messagesJson, enableThinking); },
+                     [&] { return formatChat_impl(env, h, messagesJson, enableThinking, toolsJson, toolChoice, parallelToolCalls); },
                      [&] { return env->NewStringUTF(""); });
 }
 
@@ -2116,4 +2235,50 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadSession(
                          }
                          return (jint) -1;
                      });
+}
+
+// ---------------------------------------------------------------------------
+// nativeChatResult (TEN-171)
+// ---------------------------------------------------------------------------
+// JSON the Kotlin side reads as ChatResult:
+//   {"tools_ignored":bool, "has_result":bool, "tool_parse_failed":bool,
+//    "content":"...", "reasoning_content":"...",
+//    "tool_calls":[{"id":"...","name":"...","arguments":"<json string>"}]}
+// tools_ignored is known right after nativeFormatChat(); the rest only once a completion on
+// that prompt has finished (has_result). The parsed fields are the final, non-partial parse,
+// or, when the parser rejected the reply, the raw text with tool_parse_failed set.
+// `arguments` stays a string, exactly as the model's parser produced it.
+
+static jstring chatResult_impl(JNIEnv* env, jlong h)
+{
+    nlohmann::json out = {
+        {"tools_ignored", false}, {"has_result", false}, {"tool_parse_failed", false}, {"truncated", false},
+        {"content", ""}, {"reasoning_content", ""}, {"tool_calls", nlohmann::json::array()},
+    };
+    if (h != 0L) {
+        const chat_parse_state s = chat_state_get(to_ctx(h));
+        out["tools_ignored"]     = s.tools_ignored;
+        out["has_result"]        = s.has_result;
+        out["tool_parse_failed"] = s.tool_parse_failed;
+        out["truncated"]         = s.truncated;
+        out["content"]           = s.result_content;
+        out["reasoning_content"] = s.result_reasoning;
+        for (const auto& tc : s.result_tool_calls) {
+            out["tool_calls"].push_back({{"id", tc.id}, {"name", tc.name}, {"arguments", tc.arguments}});
+        }
+    }
+    // error_handler_t::replace: model output is not guaranteed to be valid UTF-8 and the
+    // default handler throws on it.
+    return std_to_jstring(env, out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeChatResult(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jlong   h)
+{
+    return jni_guard("nativeChatResult",
+                     [&] { return chatResult_impl(env, h); },
+                     [&] { return env->NewStringUTF("{}"); });
 }
