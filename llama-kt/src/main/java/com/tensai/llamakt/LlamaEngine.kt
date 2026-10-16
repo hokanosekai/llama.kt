@@ -467,6 +467,27 @@ class LlamaEngine {
          */
         fun systemInfo(): String = nativeSystemInfo()
 
+        /**
+         * The `general.architecture` values the embedded llama.cpp can load, read from its own
+         * architecture table. Static, no model needed. Empty only when the native side failed:
+         * callers must treat an empty set as "unknown", not as "nothing is supported".
+         */
+        fun supportedArchitectures(): Set<String> =
+            nativeSupportedArchitectures().lineSequence().filter { it.isNotBlank() }.toSet()
+
+        /**
+         * The first error line llama.cpp logged during the most recent [load] (e.g.
+         * `llama_model_load: error loading model: ... unknown model architecture: 'x'`), empty
+         * when it logged none. Meant to be read right after [load] threw.
+         */
+        fun lastLoadError(): String = nativeLastLoadError()
+
+        @JvmStatic
+        private external fun nativeSupportedArchitectures(): String
+
+        @JvmStatic
+        private external fun nativeLastLoadError(): String
+
         @JvmStatic
         private external fun nativeSystemInfo(): String
 

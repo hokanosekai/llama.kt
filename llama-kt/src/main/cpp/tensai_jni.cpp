@@ -32,6 +32,7 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "llama-arch.h"
 #include "tensai_utf.h"
 #include "tensai_chat_templates.hpp"
 
@@ -84,7 +85,38 @@
 // logcat so native crashes are diagnosable from `adb logcat`.
 // ---------------------------------------------------------------------------
 
+// First ERROR line llama.cpp logged since the current load started (TEN-167), so the app can say
+// why a load failed ("unknown model architecture: 'x'", "wrong number of tensors; ...") instead of
+// a generic dialog. The first one, not the last: the last is always the unhelpful
+// "failed to load model". Cleared at the start of every load; loads are serialised by the caller.
+static std::mutex g_load_error_mutex;
+static std::string g_load_error;
+static bool g_load_error_set = false;
+
+static void load_error_reset() {
+    std::lock_guard<std::mutex> lock(g_load_error_mutex);
+    g_load_error.clear();
+    g_load_error_set = false;
+}
+
+static void load_error_note(const char* text) {
+    std::lock_guard<std::mutex> lock(g_load_error_mutex);
+    if (g_load_error_set) return;
+    g_load_error_set = true;
+    // No exception may leave a C callback: on bad_alloc the error is simply not kept.
+    try {
+        g_load_error.assign(text);
+        while (!g_load_error.empty() && (g_load_error.back() == '\n' || g_load_error.back() == '\r')) {
+            g_load_error.pop_back();
+        }
+        if (g_load_error.size() > 512) g_load_error.resize(512);
+    } catch (...) {
+        g_load_error.clear();
+    }
+}
+
 static void tensai_log_callback(lm_ggml_log_level level, const char* text, void* /* user_data */) {
+    if (level == LM_GGML_LOG_LEVEL_ERROR) load_error_note(text);
     int prio;
     switch (level) {
         case LM_GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
@@ -783,6 +815,50 @@ Java_com_tensai_llamakt_LlamaEngine_nativeKvShapeVersion(
 }
 
 // ---------------------------------------------------------------------------
+// nativeSupportedArchitectures / nativeLastLoadError  (static, TEN-167)
+// ---------------------------------------------------------------------------
+// The architecture names (general.architecture values) the embedded llama.cpp can build, one per
+// line, straight from its own LLM_ARCH_NAMES table: it cannot drift from what a load accepts.
+// And the first ERROR line of the most recent load, "" when it logged none.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeSupportedArchitectures(
+        JNIEnv* env,
+        jclass /* clazz */)
+{
+    return jni_guard("nativeSupportedArchitectures",
+                     [&] {
+                         std::string out;
+                         for (const llm_arch arch : llm_arch_all()) {
+                             // CLIP is a dummy entry (llama-quantize only): llama-model.cpp throws "unsupported model
+                             // architecture" for it. Other entries it cannot build are not filtered (no cheap list).
+                             if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_CLIP) continue;
+                             if (!out.empty()) out += '\n';
+                             out += llm_arch_name(arch);
+                         }
+                         return std_to_jstring(env, out);
+                     },
+                     [&] { return env->NewStringUTF(""); });
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_tensai_llamakt_LlamaEngine_nativeLastLoadError(
+        JNIEnv* env,
+        jclass /* clazz */)
+{
+    return jni_guard("nativeLastLoadError",
+                     [&] {
+                         std::string copy;
+                         {
+                             std::lock_guard<std::mutex> lock(g_load_error_mutex);
+                             copy = g_load_error;
+                         }
+                         return std_to_jstring(env, copy);
+                     },
+                     [&] { return env->NewStringUTF(""); });
+}
+
+// ---------------------------------------------------------------------------
 // nativeSystemInfo  (static, no model required)
 // ---------------------------------------------------------------------------
 // llama_print_system_info(): one line per registered backend, "CPU : NEON = 1 |
@@ -859,6 +935,7 @@ static jlong loadModel_impl(
     // loader, which throws on a file it can't make sense of, and the context
     // would otherwise leak past jni_guard() — a leak measured in the model's
     // own footprint, not in bytes.
+    load_error_reset();
     auto rnctx_owner = std::make_unique<rnllama::llama_rn_context>();
     auto* rnctx = rnctx_owner.get();
 
