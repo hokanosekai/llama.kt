@@ -981,6 +981,7 @@ static jlong loadModel_impl(
         jint nGpuLayers,
         jint nCtx,
         jint nThreads,
+        jint nThreadsBatch,
         jobject progressCb,
         jstring kvCacheType,
         jstring flashAttn,
@@ -1000,12 +1001,16 @@ static jlong loadModel_impl(
     p.n_ctx        = static_cast<int32_t>(nCtx > 0 ? nCtx : 4096);
     if (p.n_batch <= 0) p.n_batch = 512;
 
-    // nThreads <= 0 → keep llama.cpp auto-detect. Explicit value pins both
-    // the generation and batch (prefill) thread pools — on big.LITTLE SoCs
-    // fewer threads on big cores can beat auto across all cores.
+    // nThreads <= 0 → keep llama.cpp auto-detect. On big.LITTLE SoCs fewer
+    // threads on big cores can beat auto across all cores. nThreadsBatch sizes
+    // the batch (prefill) pool on its own, and follows nThreads when it is not
+    // given.
     if (nThreads > 0) {
         p.cpuparams.n_threads       = static_cast<int32_t>(nThreads);
         p.cpuparams_batch.n_threads = static_cast<int32_t>(nThreads);
+    }
+    if (nThreadsBatch > 0) {
+        p.cpuparams_batch.n_threads = static_cast<int32_t>(nThreadsBatch);
     }
 
     // KV cache quantization — empty/invalid falls back to f16 inside
@@ -1029,9 +1034,10 @@ static jlong loadModel_impl(
         p.chat_template = tensai::resolve_chat_template(forced_template);
     }
 
-    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d progress_cb=%d kv_cache=%s",
+    LOGI("loadModel: path=%s n_gpu_layers=%d n_ctx=%d n_batch=%d n_threads=%d n_threads_batch=%d progress_cb=%d kv_cache=%s",
          p.model.path.c_str(), p.n_gpu_layers, p.n_ctx, p.n_batch,
-         nThreads > 0 ? nThreads : -1, progressCb != nullptr,
+         nThreads > 0 ? nThreads : -1,
+         p.cpuparams_batch.n_threads > 0 ? p.cpuparams_batch.n_threads : -1, progressCb != nullptr,
          kv_type.empty() ? "f16(default)" : kv_type.c_str());
 
     LoadProgressHolder holder{};
@@ -1074,6 +1080,11 @@ static jlong loadModel_impl(
     }
 
     LOGI("loadModel OK, ptr=%p", rnctx);
+    // What the context really got (not what was asked) and what the CPU backend can use: a Q4_K
+    // prefill that runs far below the expected tok/s is a build without dotprod/repack, or threads
+    // that never reached the context (TEN-182).
+    LOGI("loadModel: context n_threads=%d n_threads_batch=%d n_batch=%u n_ubatch=%u", llama_n_threads(rnctx->ctx), llama_n_threads_batch(rnctx->ctx), llama_n_batch(rnctx->ctx), llama_n_ubatch(rnctx->ctx));
+    LOGI("loadModel: system_info %s", llama_print_system_info());
     // Ownership moves to the Kotlin side, which gives it back in nativeFree().
     return static_cast<jlong>(reinterpret_cast<uintptr_t>(rnctx_owner.release()));
 }
@@ -1086,6 +1097,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
         jint nGpuLayers,
         jint nCtx,
         jint nThreads,
+        jint nThreadsBatch,
         jobject progressCb,
         jstring kvCacheType,
         jstring flashAttn,
@@ -1094,7 +1106,7 @@ Java_com_tensai_llamakt_LlamaEngine_nativeLoadModel(
     // 0 is the handle value the Kotlin side already reads as "load failed".
     return jni_guard("nativeLoadModel",
                      [&] {
-                         return loadModel_impl(env, path, nGpuLayers, nCtx, nThreads,
+                         return loadModel_impl(env, path, nGpuLayers, nCtx, nThreads, nThreadsBatch,
                                                progressCb, kvCacheType, flashAttn, chatTemplate);
                      },
                      [] { return (jlong) 0; });
@@ -1141,6 +1153,20 @@ Java_com_tensai_llamakt_LlamaEngine_nativeFree(
 // several tokens, or none. Under-counting there reads as a Complete reply on
 // a decode that was cut off mid-sentence. Zero on every early exit: nothing
 // was generated.
+
+// One line with llama.cpp's own timing of the decode that just ended: prompt eval (prefill) and
+// token generation, each as tokens and tokens/s. n_p_eval counts the tokens actually decoded, so
+// a prompt served from the KV cache reads small (TEN-182: prefill measured at ~6 tok/s).
+static void log_perf(const char* where, rnllama::llama_rn_context* rnctx) {
+    if (rnctx == nullptr || rnctx->ctx == nullptr) return;
+    const llama_perf_context_data d = llama_perf_context(rnctx->ctx);
+    LOGI("%s: perf prompt_eval %d tok in %.0f ms (%.1f tok/s), eval %d tok in %.0f ms (%.1f tok/s), "
+         "n_threads=%d n_threads_batch=%d n_ubatch=%u",
+         where,
+         d.n_p_eval, d.t_p_eval_ms, d.t_p_eval_ms > 0 ? 1e3 * d.n_p_eval / d.t_p_eval_ms : 0.0,
+         d.n_eval, d.t_eval_ms, d.t_eval_ms > 0 ? 1e3 * d.n_eval / d.t_eval_ms : 0.0,
+         llama_n_threads(rnctx->ctx), llama_n_threads_batch(rnctx->ctx), llama_n_ubatch(rnctx->ctx));
+}
 
 // Invariant (TEN-114, generalising TEN-92): whenever a completion or a prefill
 // is left, for any reason, embd holds exactly the tokens decoded into seq 0 of
@@ -1589,6 +1615,7 @@ static jint completion_impl(
     // Read after the loop, not accumulated alongside it: rewind() zeroes it on
     // entry and doCompletion() is the only thing that raises it, so this is the
     // decode's own count and nothing else's.
+    log_perf("nativeCompletion", rnctx);
     return static_cast<jint>(comp->num_tokens_predicted);
 }
 
@@ -1760,11 +1787,13 @@ static jint prefill_impl(
     const size_t target = comp->embd.size();
     // Restored when this function is left, however it is left. See PREFILL_CHUNK_TOKENS.
     scoped_n_batch chunking(rnctx, PREFILL_CHUNK_TOKENS);
+    llama_perf_context_reset(rnctx->ctx);
     comp->nextToken();
     comp->has_next_token = false;
     const bool complete = comp->n_past >= static_cast<llama_pos>(target);
     trim_embd_to_n_past(comp);
 
+    log_perf("nativePrefill", rnctx);
     LOGI("nativePrefill: n_past=%d of %zu tokens (interrupted=%d)",
          comp->n_past, target, comp->is_interrupted ? 1 : 0);
     // An interrupt is an answer, not a failure: the prefix that did land stays.

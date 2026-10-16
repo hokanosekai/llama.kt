@@ -203,6 +203,10 @@ class LlamaEngine {
      *     detection fails.
      *   -1 → force llama.cpp auto-detect.
      *   > 0 → explicit thread count.
+     * [nThreadsBatch] = CPU threads for prompt prefill (batch decode).
+     *   0 (default) → with an explicit [nThreads] the same count, otherwise
+     *   [ThreadPolicy]: the big cores plus half of the others, leaving one core
+     *   for the UI. -1 → llama.cpp auto-detect (follows [nThreads] when that is explicit). > 0 → explicit thread count.
      * [onProgress] — optional loading progress (0.0–1.0), called from the
      *   loading thread; return false to abort the load.
      * [kvCacheType] — KV cache quantization: null → f16 (default), "q8_0" →
@@ -227,13 +231,28 @@ class LlamaEngine {
         kvCacheType: String? = null,
         flashAttn: String? = null,
         chatTemplate: String? = null,
+        nThreadsBatch: Int = 0,
     ) {
+        val policy = if (nThreads == 0) {
+            ThreadPolicy.resolve(ThreadPolicy.readCoreSpeeds())
+        } else {
+            ThreadCounts(0, 0)
+        }
         val resolved = when {
             nThreads > 0 -> nThreads
-            nThreads == 0 -> detectBigCoreCount()  // 0 on failure → llama auto
-            else -> 0                              // -1 → llama auto
+            nThreads == 0 -> policy.decode  // 0 on failure → llama auto
+            else -> 0                       // -1 → llama auto
         }
-        handle = nativeLoadModel(path, nGpuLayers, nCtx, resolved, onProgress, kvCacheType, flashAttn, chatTemplate)
+        val resolvedBatch = when {
+            nThreadsBatch > 0 -> nThreadsBatch
+            nThreadsBatch < 0 -> 0
+            nThreads > 0 -> nThreads
+            nThreads < 0 -> 0
+            else -> policy.batch
+        }
+        handle = nativeLoadModel(
+            path, nGpuLayers, nCtx, resolved, resolvedBatch, onProgress, kvCacheType, flashAttn, chatTemplate,
+        )
         if (handle == 0L) {
             throw IllegalStateException("nativeLoadModel failed: $path")
         }
@@ -411,7 +430,7 @@ class LlamaEngine {
     private external fun nativeListBackends(): String
     private external fun nativeActiveBackend(h: Long): String
     private external fun nativeLoadModel(
-        path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int,
+        path: String, nGpuLayers: Int, nCtx: Int, nThreads: Int, nThreadsBatch: Int,
         progressCb: LoadProgressCallback?, kvCacheType: String?, flashAttn: String?, chatTemplate: String?,
     ): Long
     private external fun nativeFree(h: Long)
@@ -540,28 +559,9 @@ class LlamaEngine {
         private external fun nativeKvShapeVersion(): Long
 
         /**
-         * Count the "big" cores of a big.LITTLE SoC: cores whose
-         * cpuinfo_max_freq is at least 85% of the fastest core's.
-         * The 85% cutoff separates efficiency cores (e.g. A55 at 2.0GHz
-         * vs A78 at 2.4GHz = 83%) while keeping mid cores on 3-tier SoCs
-         * (e.g. A78 at 2.6GHz vs X1 at 3.0GHz = 87%).
+         * Count the "big" cores of a big.LITTLE SoC, see [ThreadPolicy.bigCoreCount].
          * Returns 0 if sysfs is unreadable (caller should fall back to auto).
          */
-        fun detectBigCoreCount(): Int = try {
-            val freqs = java.io.File("/sys/devices/system/cpu")
-                .listFiles { f -> f.name.matches(Regex("cpu\\d+")) }
-                ?.mapNotNull { cpu ->
-                    runCatching {
-                        java.io.File(cpu, "cpufreq/cpuinfo_max_freq")
-                            .readText().trim().toLong()
-                    }.getOrNull()
-                }
-                .orEmpty()
-            if (freqs.isEmpty()) 0
-            else {
-                val max = freqs.max()
-                freqs.count { it * 100 >= max * 85 }
-            }
-        } catch (_: Exception) { 0 }
+        fun detectBigCoreCount(): Int = ThreadPolicy.bigCoreCount(ThreadPolicy.readCoreSpeeds())
     }
 }
